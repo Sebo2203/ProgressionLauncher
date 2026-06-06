@@ -1573,6 +1573,33 @@ class ProgressorApp(tk.Tk):
         self.steamcmd_path.set(str(detected_steamcmd) if detected_steamcmd else "")
         self.progress("Auto-detected paths from Steam libraries and standard RimWorld config locations.")
 
+    def auto_detect_invalid_paths(self) -> None:
+        detected: list[str] = []
+        workshop = Path(self.workshop_path.get().strip()) if self.workshop_path.get().strip() else None
+        if workshop is None or not workshop.exists():
+            self.workshop_path.set(str(default_workshop_path()))
+            detected.append("Workshop")
+
+        local_mods = Path(self.local_mods_path.get().strip()) if self.local_mods_path.get().strip() else None
+        if local_mods is None or not local_mods.exists():
+            self.local_mods_path.set(str(default_rimworld_mods_path()))
+            detected.append("Local Mods")
+
+        mods_config = Path(self.mods_config_path.get().strip()) if self.mods_config_path.get().strip() else None
+        if mods_config is None or not mods_config.parent.exists():
+            self.mods_config_path.set(str(default_mods_config_path()))
+            detected.append("ModsConfig")
+
+        configured_steamcmd = Path(self.steamcmd_path.get().strip()) if self.steamcmd_path.get().strip() else None
+        if configured_steamcmd is None or not configured_steamcmd.exists():
+            detected_steamcmd = find_steamcmd()
+            self.steamcmd_path.set(str(detected_steamcmd) if detected_steamcmd else "")
+            if detected_steamcmd:
+                detected.append("SteamCMD")
+
+        if detected:
+            self.progress(f"Play Now auto-detected invalid or missing paths: {', '.join(detected)}.")
+
     def run_worker(self, target) -> None:
         threading.Thread(target=target, daemon=True).start()
 
@@ -1610,6 +1637,8 @@ class ProgressorApp(tk.Tk):
         )
 
     def play_now(self) -> None:
+        self.auto_detect_invalid_paths()
+
         def worker() -> None:
             old_env = os.environ.get("STEAMCMD")
             try:
