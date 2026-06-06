@@ -26,7 +26,7 @@ import tkinter as tk
 
 APP_ID = "294100"
 APP_NAME = "Progression Launcher"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 COLLECTIONS = {
     "Core": "3521297585",
     "Content": "3521319712",
@@ -65,7 +65,6 @@ BUNDLED_CACHE_PATH = asset_path("collection_cache.json")
 ALWAYS_ENABLED_PATH = app_data_dir() / "always_enabled.json"
 DISABLED_MODS_PATH = app_data_dir() / "disabled_mods.json"
 FROZEN_PROFILES_PATH = app_data_dir() / "frozen_profiles"
-STAGING_STATE_PATH = app_data_dir() / "staging_state.json"
 SETTINGS_PATH = app_data_dir() / "settings.json"
 LOCAL_METADATA_CACHE_PATH = app_data_dir() / "local_metadata_cache.json"
 SORT_CACHE_PATH = app_data_dir() / "sort_cache.json"
@@ -124,6 +123,13 @@ class SortResult:
     dependency_edges: int
     load_rule_edges: int
     broken_edges: int
+
+
+@dataclass(frozen=True)
+class FrozenStageResult:
+    item_ids: set[str]
+    executable_path: Path
+    user_data_path: Path
 
 
 def steam_root_candidates() -> list[Path]:
@@ -626,8 +632,12 @@ def frozen_profile_path(profile_name: str) -> Path:
     return FROZEN_PROFILES_PATH / profile_name
 
 
-def frozen_config_path(profile_name: str) -> Path:
-    return frozen_profile_path(profile_name) / "Config"
+def frozen_user_data_path(profile_name: str) -> Path:
+    return frozen_profile_path(profile_name) / "UserData"
+
+
+def frozen_game_path(profile_name: str) -> Path:
+    return frozen_profile_path(profile_name) / "Game"
 
 
 def load_frozen_manifest(profile_name: str) -> dict:
@@ -1001,197 +1011,186 @@ def restore_quarantined_mods(workshop_path: Path, mods: list[QuarantinedMod], pr
 
 
 def frozen_active_item_ids(result: ScanResult) -> list[str]:
-    active = [
-        *[
-            item_id
-            for item_id in result.ready_ids
-            if item_id not in result.disabled_ids or item_id in result.always_enabled_ids
-        ],
-        *[
-            item_id
-            for item_id in sorted(result.always_enabled_ids, key=int)
-            if item_id in result.installed_ids and item_id not in result.ready_ids
-        ],
+    active_packages = existing_active_mods(result.mods_config_path)
+    if not active_packages:
+        raise RuntimeError("ModsConfig.xml contains no active mods to freeze.")
+    package_to_item: dict[str, str] = {}
+    for item_id, package_id in result.installed_package_ids.items():
+        normalized = package_id.lower()
+        if normalized and normalized not in package_to_item and item_id in result.item_paths:
+            package_to_item[normalized] = item_id
+    item_ids: list[str] = []
+    missing_packages: list[str] = []
+    for package_id in active_packages:
+        if package_id.startswith("ludeon.rimworld"):
+            continue
+        item_id = package_to_item.get(package_id)
+        if item_id:
+            if item_id not in item_ids:
+                item_ids.append(item_id)
+        else:
+            missing_packages.append(package_id)
+    if missing_packages:
+        preview = ", ".join(missing_packages[:8])
+        if len(missing_packages) > 8:
+            preview += f", and {len(missing_packages) - 8} more"
+        raise RuntimeError(
+            "Cannot create an exact frozen profile because active ModsConfig entries "
+            f"could not be matched to installed mod folders: {preview}"
+        )
+    return item_ids
+
+
+def rimworld_executable(game_root: Path) -> Path | None:
+    candidates = [
+        game_root / "RimWorldWin64.exe",
+        game_root / "RimWorldWin.exe",
     ]
-    return [item_id for item_id in active if item_id in result.item_paths]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
-def create_frozen_profile(result: ScanResult, profile_name: str, progress) -> Path:
+def copy_rimworld_game_snapshot(game_root: Path, target: Path, progress) -> None:
+    executable = rimworld_executable(game_root)
+    if not executable:
+        raise RuntimeError(f"RimWorld executable was not found in {game_root}.")
+    progress("Freezing RimWorld game files...")
+
+    def ignore_live_mods(directory: str, names: list[str]) -> set[str]:
+        if Path(directory).resolve() != game_root.resolve():
+            return set()
+        return {
+            name
+            for name in names
+            if name.lower() == "mods" or name.lower().startswith("mods - ")
+        }
+
+    shutil.copytree(game_root, target, ignore=ignore_live_mods)
+    (target / "Mods").mkdir(parents=True, exist_ok=True)
+
+
+def create_frozen_profile(
+    result: ScanResult,
+    profile_name: str,
+    progress,
+    progress_count=None,
+) -> Path:
     profile_name = safe_profile_name(profile_name)
     if not profile_name:
         raise RuntimeError("Profile name cannot be empty.")
     active_ids = frozen_active_item_ids(result)
     if not active_ids:
         raise RuntimeError("No active mods are available to freeze.")
-    profile_root = frozen_profile_path(profile_name)
-    mods_root = profile_root / "Mods"
-    if profile_root.exists():
+    final_profile_root = frozen_profile_path(profile_name)
+    if final_profile_root.exists():
         raise RuntimeError(f"Frozen profile already exists: {profile_name}")
-    mods_root.mkdir(parents=True, exist_ok=True)
-    entries: list[dict[str, str]] = []
-    for item_id in active_ids:
-        source = result.item_paths[item_id]
-        target = mods_root / item_id
-        progress(f"Freezing {item_id}...")
-        shutil.copytree(source, target)
-        item = result.required.get(item_id)
-        entries.append(
-            {
-                "item_id": item_id,
-                "package_id": result.installed_package_ids.get(item_id, ""),
-                "title": item.title if item else "",
-                "source": str(source),
-            }
-        )
-    manifest = {
-        "name": profile_name,
-        "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
-        "item_ids": active_ids,
-        "mods": entries,
-    }
-    config_source = result.mods_config_path.parent
-    config_target = frozen_config_path(profile_name)
-    if config_source.exists():
-        progress("Freezing RimWorld config files...")
-        shutil.copytree(config_source, config_target)
-    else:
-        config_target.mkdir(parents=True, exist_ok=True)
-    (profile_root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return profile_root
-
-
-def replace_directory(source: Path, target: Path) -> None:
-    if target.exists():
-        shutil.rmtree(target)
-    shutil.copytree(source, target)
-
-
-def save_live_config_to_frozen(profile_name: str, live_config_path: Path, progress) -> None:
-    if not profile_name or not live_config_path.exists():
-        return
-    target = frozen_config_path(profile_name)
-    progress(f"Saving config changes into frozen profile: {profile_name}")
-    replace_directory(live_config_path, target)
-
-
-def stage_frozen_config(profile_name: str, live_config_path: Path, staging_root: Path, state: dict, save_state, progress) -> None:
-    frozen_config = frozen_config_path(profile_name)
-    if not frozen_config.exists():
-        frozen_config.mkdir(parents=True, exist_ok=True)
-    staged_config = staging_root / "live_config"
-    state["config"] = {
-        "live": str(live_config_path),
-        "staged": str(staged_config),
-    }
-    if live_config_path.exists():
-        progress("Staging live RimWorld config files...")
-        shutil.move(str(live_config_path), str(staged_config))
-    else:
-        staged_config.mkdir(parents=True, exist_ok=True)
-    save_state()
-    progress("Applying frozen RimWorld config files...")
-    shutil.copytree(frozen_config, live_config_path)
-
-
-def restore_staged_live(progress) -> None:
-    if not STAGING_STATE_PATH.exists():
-        return
+    FROZEN_PROFILES_PATH.mkdir(parents=True, exist_ok=True)
+    profile_root = FROZEN_PROFILES_PATH / f".creating_{profile_name}_{timestamp()}"
+    game_root = result.local_mods_path.parent
+    game_target = profile_root / "Game"
+    mods_root = game_target / "Mods"
     try:
-        state = json.loads(STAGING_STATE_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    profile_name = str(state.get("profile", ""))
-    config_state = state.get("config", {})
-    if isinstance(config_state, dict) and config_state.get("live") and config_state.get("staged"):
-        live_config = Path(config_state.get("live", ""))
-        staged_config = Path(config_state.get("staged", ""))
-        if live_config.exists():
-            save_live_config_to_frozen(profile_name, live_config, progress)
-            progress("Removing staged frozen RimWorld config files...")
-            shutil.rmtree(live_config)
-        if staged_config.exists():
-            progress("Restoring live RimWorld config files...")
-            live_config.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(staged_config), str(live_config))
-    restored = 0
-    for entry in reversed(state.get("moved", [])):
-        original = Path(entry.get("original", ""))
-        staged = Path(entry.get("staged", ""))
-        if not staged.exists():
-            continue
-        if original.exists():
-            progress(f"Keeping staged copy because original already exists: {original}")
-            continue
-        original.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staged), str(original))
-        restored += 1
-    for path_text in state.get("frozen_copies", []):
-        path = Path(path_text)
-        if path.exists():
-            shutil.rmtree(path)
-    try:
-        staging_root = Path(state.get("staging_root", ""))
-        if staging_root.exists() and not any(staging_root.rglob("*")):
-            shutil.rmtree(staging_root)
-    except OSError:
-        pass
-    try:
-        STAGING_STATE_PATH.unlink()
-    except OSError:
-        pass
-    if restored:
-        progress(f"Restored {restored} live mod folder(s) after frozen profile.")
+        copy_rimworld_game_snapshot(game_root, game_target, progress)
+        entries: list[dict[str, str]] = []
+        total = len(active_ids)
+        if progress_count is not None:
+            progress_count(0, total)
+        for index, item_id in enumerate(active_ids, start=1):
+            source = result.item_paths[item_id]
+            target = mods_root / item_id
+            remaining = total - index
+            progress(f"Freezing mod {index}/{total}: {item_id} ({remaining} left)...")
+            shutil.copytree(source, target)
+            item = result.required.get(item_id)
+            entries.append(
+                {
+                    "item_id": item_id,
+                    "package_id": result.installed_package_ids.get(item_id, ""),
+                    "title": item.title if item else "",
+                    "source": str(source),
+                }
+            )
+            if progress_count is not None:
+                progress_count(index, total)
+        user_data_source = result.mods_config_path.parent.parent
+        user_data_target = profile_root / "UserData"
+        if user_data_source.exists():
+            progress("Freezing saves, settings, and RimWorld/mod user data...")
+            shutil.copytree(user_data_source, user_data_target)
+        else:
+            user_data_target.mkdir(parents=True, exist_ok=True)
+        version_path = game_root / "Version.txt"
+        try:
+            game_version = version_path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            game_version = ""
+        manifest = {
+            "format_version": 2,
+            "name": profile_name,
+            "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
+            "game_version": game_version,
+            "game_executable": "RimWorldWin64.exe",
+            "user_data": "UserData",
+            "item_ids": active_ids,
+            "mods": entries,
+        }
+        (profile_root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        profile_root.rename(final_profile_root)
+        return final_profile_root
+    except Exception:
+        if profile_root.exists():
+            shutil.rmtree(profile_root, ignore_errors=True)
+        raise
 
 
-def stage_frozen_profile(profile_name: str, workshop_path: Path, local_mods_path: Path, mods_config_path: Path, progress) -> set[str]:
-    restore_staged_live(progress)
+def stage_frozen_profile(
+    profile_name: str,
+    progress,
+    progress_count=None,
+) -> FrozenStageResult:
     manifest = load_frozen_manifest(profile_name)
     item_ids = [str(item_id) for item_id in manifest.get("item_ids", []) if str(item_id).isdigit()]
-    profile_mods = frozen_profile_path(profile_name) / "Mods"
+    format_version = int(manifest.get("format_version", 1) or 1)
+    if format_version < 2:
+        raise RuntimeError(
+            "This legacy frozen profile is no longer supported. Remove it and create a new full profile."
+        )
+    profile_mods = frozen_game_path(profile_name) / "Mods"
     if not item_ids:
         raise RuntimeError(f"Frozen profile contains no mods: {profile_name}")
-    staging_root = app_data_dir() / "staged_live" / timestamp()
-    staging_root.mkdir(parents=True, exist_ok=True)
-    state = {
-        "profile": profile_name,
-        "staged_at": _dt.datetime.now().isoformat(timespec="seconds"),
-        "staging_root": str(staging_root),
-        "moved": [],
-        "frozen_copies": [],
-    }
-    def save_state() -> None:
-        STAGING_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    game_root = frozen_game_path(profile_name)
+    executable = rimworld_executable(game_root)
+    user_data = frozen_user_data_path(profile_name)
+    if not executable:
+        raise RuntimeError(f"Frozen profile is missing its RimWorld executable: {profile_name}")
+    if not user_data.exists():
+        raise RuntimeError(f"Frozen profile is missing its UserData snapshot: {profile_name}")
+    total = len(item_ids)
+    if progress_count is not None:
+        progress_count(0, total)
+    for index, item_id in enumerate(item_ids, start=1):
+        frozen_source = profile_mods / item_id
+        if not frozen_source.exists():
+            raise RuntimeError(f"Frozen profile is missing mod folder {item_id}.")
+        remaining = total - index
+        progress(f"Validating frozen mod {index}/{total}: {item_id} ({remaining} left)...")
+        if progress_count is not None:
+            progress_count(index, total)
+    progress("Frozen game, mods, load order, saves, settings, and mod data are ready.")
+    return FrozenStageResult(set(item_ids), executable, user_data)
 
-    save_state()
-    try:
-        stage_frozen_config(profile_name, mods_config_path.parent, staging_root, state, save_state, progress)
-        save_state()
-        for item_id in item_ids:
-            frozen_source = profile_mods / item_id
-            if not frozen_source.exists():
-                raise RuntimeError(f"Frozen profile is missing mod folder {item_id}.")
-            for source_root, label in ((workshop_path, "workshop"), (local_mods_path, "local")):
-                live_path = source_root / item_id
-                if live_path.exists():
-                    staged_path = staging_root / label / item_id
-                    staged_path.parent.mkdir(parents=True, exist_ok=True)
-                    progress(f"Staging live {label} copy of {item_id}...")
-                    shutil.move(str(live_path), str(staged_path))
-                    state["moved"].append({"original": str(live_path), "staged": str(staged_path)})
-                    save_state()
-            target = local_mods_path / item_id
-            progress(f"Staging frozen {item_id}...")
-            shutil.copytree(frozen_source, target)
-            state["frozen_copies"].append(str(target))
-            save_state()
-    except OSError as exc:
-        progress("Frozen staging hit a locked file. Rolling back staged files...")
-        restore_staged_live(progress)
-        raise RuntimeError(
-            f"Could not stage frozen profile because a file is in use: {exc}. "
-            "Close RimWorld, Steam update activity, RimSort, and file explorers pointed at mod folders, then try again."
-        )
-    return set(item_ids)
+
+def launch_frozen_game(executable_path: Path, user_data_path: Path | None, progress) -> None:
+    if not executable_path.is_file():
+        raise RuntimeError(f"Frozen RimWorld executable was not found: {executable_path}")
+    progress(f"Launching frozen RimWorld directly from {executable_path.parent}...")
+    command = [str(executable_path)]
+    if user_data_path is not None:
+        command.append(f"-savedatafolder={user_data_path}")
+        progress(f"Frozen saves and settings are isolated at {user_data_path}")
+    subprocess.Popen(command, cwd=str(executable_path.parent))
 
 
 def registered_workshop_ids(workshop_path: Path) -> set[str]:
@@ -2023,7 +2022,8 @@ class ProgressorApp(tk.Tk):
         ttk.Button(self.frozen_frame, text="Refresh Profiles", command=self.refresh_frozen_profiles).pack(side="left", padx=(8, 0))
         ttk.Button(self.frozen_frame, text="Freeze Current Setup", command=self.freeze_current_setup).pack(side="left", padx=(8, 0))
         ttk.Button(self.frozen_frame, text="Play Frozen", command=self.play_frozen).pack(side="left", padx=(8, 0))
-        ttk.Button(self.frozen_frame, text="Restore Live Setup", command=self.restore_live_setup).pack(side="left", padx=(8, 0))
+        ttk.Button(self.frozen_frame, text="Open Selected Folder", command=self.open_frozen_profile_folder).pack(side="left", padx=(8, 0))
+        ttk.Button(self.frozen_frame, text="Remove Selected", command=self.remove_frozen_profile).pack(side="left", padx=(8, 0))
         self.frozen_frame.grid_remove()
 
         main = ttk.PanedWindow(self, orient="horizontal")
@@ -2570,6 +2570,12 @@ class ProgressorApp(tk.Tk):
         self.run_busy_worker("Checking updates before launch...", worker)
 
     def play_now(self) -> None:
+        if rimworld_is_running():
+            messagebox.showinfo(
+                "Close RimWorld",
+                "Close RimWorld before restoring the live profile or starting another session.",
+            )
+            return
         self.auto_detect_invalid_paths()
         auto_update = self.auto_update_on_launch.get()
 
@@ -2581,7 +2587,6 @@ class ProgressorApp(tk.Tk):
                     os.environ["STEAMCMD"] = steamcmd
 
                 self.progress("Play Now started.")
-                restore_staged_live(self.progress)
                 required_snapshot = fetch_required_items(self.progress)
                 result = self.scan_paths_with_required(required_snapshot, self.progress)
                 if auto_update:
@@ -2873,10 +2878,22 @@ class ProgressorApp(tk.Tk):
         if not profile_name:
             messagebox.showinfo("Name required", "Enter a profile name.")
             return
+        if not messagebox.askyesno(
+            "Create full frozen profile?",
+            "This creates an independent copy of the active mods, RimWorld game version, saves, "
+            "settings, and mod data. Large modpacks can require many gigabytes of free disk space.\n\n"
+            "Continue?",
+        ):
+            return
 
         def worker() -> None:
             try:
-                path = create_frozen_profile(result, profile_name, self.progress)
+                path = create_frozen_profile(
+                    result,
+                    profile_name,
+                    self.progress,
+                    progress_count=self.update_busy_download_progress,
+                )
                 self.progress(f"Frozen profile created: {path}")
                 self.after(0, self.refresh_frozen_profiles)
                 self.after(0, lambda: self.frozen_profile.set(profile_name))
@@ -2889,7 +2906,10 @@ class ProgressorApp(tk.Tk):
 
     def play_frozen(self) -> None:
         if rimworld_is_running():
-            messagebox.showinfo("Close RimWorld", "Close RimWorld before playing a frozen profile so live mod/config files can be staged safely.")
+            messagebox.showinfo(
+                "Close RimWorld",
+                "Close RimWorld before starting another frozen session.",
+            )
             return
         self.refresh_frozen_profiles()
         profile_name = self.frozen_profile.get().strip()
@@ -2903,51 +2923,74 @@ class ProgressorApp(tk.Tk):
         def worker() -> None:
             try:
                 self.progress(f"Playing frozen profile: {profile_name}")
-                profile_ids = stage_frozen_profile(
+                staged = stage_frozen_profile(
                     profile_name,
-                    Path(self.workshop_path.get()),
-                    Path(self.local_mods_path.get()),
-                    Path(self.mods_config_path.get()),
+                    self.progress,
+                    progress_count=self.update_busy_download_progress,
+                )
+                launch_frozen_game(
+                    staged.executable_path,
+                    staged.user_data_path,
                     self.progress,
                 )
-                if self.exclude_cosmetics.get():
-                    excluded_profile_ids = profile_ids & cached_cosmetic_ids()
-                    profile_ids.difference_update(excluded_profile_ids)
-                    if excluded_profile_ids:
-                        self.progress(
-                            f"Cosmetics exclusion disabled {len(excluded_profile_ids)} mod(s) from the frozen profile."
-                        )
-                result = self.scan_paths(self.progress)
-                result.always_enabled_ids = set(profile_ids)
-                result.disabled_ids.difference_update(profile_ids)
-                sort_result = get_or_build_sort_result(result, self.progress)
-                self.current_result = result
-                self.current_sort_result = sort_result
-                self.after(0, lambda: self.render_result(result, sort_result))
-                write_mods_config(result, self.progress, sort_result)
-                self.progress("Launching RimWorld through Steam with frozen profile...")
-                webbrowser.open(STEAM_RUN_RIMWORLD)
-            except (RuntimeError, OSError, urllib.error.URLError) as exc:
+            except (RuntimeError, OSError) as exc:
                 self.progress(f"Play Frozen failed: {exc}")
                 error = str(exc)
                 self.after(0, lambda: messagebox.showerror("Play Frozen failed", error))
 
-        self.run_busy_worker("Staging frozen profile...", worker)
+        self.run_busy_worker("Validating frozen profile...", worker)
 
-    def restore_live_setup(self) -> None:
+    def remove_frozen_profile(self) -> None:
+        if rimworld_is_running():
+            messagebox.showinfo(
+                "Close RimWorld",
+                "Close RimWorld before removing a frozen profile.",
+            )
+            return
+        self.refresh_frozen_profiles()
+        profile_name = self.frozen_profile.get().strip()
+        if not profile_name or profile_name not in frozen_profile_names():
+            messagebox.showinfo("Select frozen profile", "Select a frozen profile to remove.")
+            return
+        profile_path = frozen_profile_path(profile_name)
+        if not messagebox.askyesno(
+            "Remove frozen profile?",
+            f"Delete frozen profile '{profile_name}' and all of its copied mods, game files, "
+            "settings, and saves?\n\nThis cannot be undone.",
+        ):
+            return
+
         def worker() -> None:
             try:
-                restore_staged_live(self.progress)
-                result = self.scan_paths(self.progress)
-                self.current_result = result
-                self.after(0, lambda: self.render_result(result))
-                self.progress("Live setup restored.")
-            except (RuntimeError, OSError, urllib.error.URLError) as exc:
-                self.progress(f"Restore live failed: {exc}")
+                self.progress(f"Removing frozen profile: {profile_name}")
+                shutil.rmtree(profile_path)
+                self.progress(f"Removed frozen profile: {profile_name}")
+                self.after(0, self.refresh_frozen_profiles)
+            except OSError as exc:
                 error = str(exc)
-                self.after(0, lambda: messagebox.showerror("Restore live failed", error))
+                self.progress(f"Remove frozen profile failed: {error}")
+                self.after(0, lambda: messagebox.showerror("Remove failed", error))
 
-        self.run_busy_worker("Restoring live setup...", worker)
+        self.run_busy_worker("Removing frozen profile...", worker)
+
+    def open_frozen_profile_folder(self) -> None:
+        self.refresh_frozen_profiles()
+        profile_name = self.frozen_profile.get().strip()
+        if not profile_name or profile_name not in frozen_profile_names():
+            messagebox.showinfo("Select frozen profile", "Select a frozen profile to open.")
+            return
+        profile_path = frozen_profile_path(profile_name)
+        if not profile_path.is_dir():
+            messagebox.showerror(
+                "Profile folder missing",
+                f"The selected profile folder could not be found:\n\n{profile_path}",
+            )
+            return
+        try:
+            os.startfile(profile_path)
+            self.progress(f"Opened frozen profile folder: {profile_path}")
+        except OSError as exc:
+            messagebox.showerror("Could not open folder", str(exc))
 
     def open_quarantine_folder(self) -> None:
         workshop_path = Path(self.workshop_path.get())
