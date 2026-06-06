@@ -54,6 +54,7 @@ BUNDLED_CACHE_PATH = asset_path("collection_cache.json")
 ALWAYS_ENABLED_PATH = app_data_dir() / "always_enabled.json"
 FROZEN_PROFILES_PATH = app_data_dir() / "frozen_profiles"
 STAGING_STATE_PATH = app_data_dir() / "staging_state.json"
+SETTINGS_PATH = app_data_dir() / "settings.json"
 
 
 @dataclass(frozen=True)
@@ -395,6 +396,37 @@ def save_always_enabled_ids(item_ids: set[str]) -> None:
     ALWAYS_ENABLED_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def load_settings() -> dict[str, object]:
+    if not SETTINGS_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    settings: dict[str, object] = {}
+    for key in {"workshop_path", "local_mods_path", "mods_config_path", "steamcmd_path"}:
+        value = payload.get(key)
+        if value:
+            settings[key] = str(value)
+    settings["exclude_cosmetics"] = payload.get("exclude_cosmetics") is True
+    return settings
+
+
+def save_settings(settings: dict[str, object]) -> None:
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+
+
+def cached_cosmetic_ids() -> set[str]:
+    return {
+        item_id
+        for item_id, item in load_collection_cache().items()
+        if item.collection == "Cosmetics"
+    }
+
+
 def safe_profile_name(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_. -]+", "", name).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
@@ -569,8 +601,26 @@ def find_quarantined_mods(workshop_path: Path) -> list[QuarantinedMod]:
     return quarantined
 
 
-def scan(workshop_path: Path, local_mods_path: Path, mods_config_path: Path, progress) -> ScanResult:
+def scan(
+    workshop_path: Path,
+    local_mods_path: Path,
+    mods_config_path: Path,
+    progress,
+    exclude_cosmetics: bool = False,
+) -> ScanResult:
     required = fetch_required_items(progress)
+    cosmetic_ids = {
+        item_id
+        for item_id, item in required.items()
+        if item.collection == "Cosmetics"
+    }
+    if exclude_cosmetics:
+        required = {
+            item_id: item
+            for item_id, item in required.items()
+            if item_id not in cosmetic_ids
+        }
+        progress(f"Cosmetics excluded: {len(cosmetic_ids)} pack items will not be downloaded or enabled.")
     progress("Scanning local Workshop folder...")
     workshop_ids, workshop_package_ids, workshop_paths = scan_mod_folder(workshop_path)
     progress("Scanning RimWorld local Mods folder...")
@@ -591,6 +641,8 @@ def scan(workshop_path: Path, local_mods_path: Path, mods_config_path: Path, pro
     required_ids = set(required)
     required_order = list(required)
     always_enabled_ids = load_always_enabled_ids()
+    if exclude_cosmetics:
+        always_enabled_ids.difference_update(cosmetic_ids)
     return ScanResult(
         required=required,
         required_order=required_order,
@@ -997,8 +1049,10 @@ def run_steamcmd_downloads(
     if not targets:
         raise RuntimeError("There are no SteamCMD mods to download or validate.")
 
+    targets = list(dict.fromkeys(targets))
     total = len(targets)
     completed_ids: set[str] = set()
+    failed_item_ids: set[str] = set()
 
     def report_count() -> None:
         completed = len(completed_ids)
@@ -1013,53 +1067,85 @@ def run_steamcmd_downloads(
     relocate_unregistered_workshop_mods(result, targets, progress)
     downloaded_root = prepare_steamcmd_local_download_root(steamcmd_root, result.local_mods_path, progress)
 
-    # SteamCMD accepts many +workshop_download_item commands in one invocation,
-    # but huge command lines can hit Windows limits. Batches keep it boring.
-    batch_size = 40
-    for index in range(0, len(targets), batch_size):
-        batch = targets[index : index + batch_size]
-        progress(f"Downloading/validating batch {index // batch_size + 1}: {len(batch)} mods...")
-        script_lines = ["@ShutdownOnFailedCommand 0", "@NoPromptForPassword 1", "login anonymous"]
-        script_lines.extend(f"workshop_download_item {APP_ID} {item_id} validate" for item_id in batch)
-        script_lines.append("quit")
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as handle:
-            handle.write("\n".join(script_lines))
-            script_path = Path(handle.name)
-        try:
-            process = subprocess.Popen(
-                [str(steamcmd), "+runscript", str(script_path)],
-                cwd=str(steamcmd_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-            )
-            assert process.stdout is not None
-            for line in process.stdout:
-                line = line.strip()
-                if "Success. Downloaded item" in line or "ERROR!" in line or "FAILED" in line:
-                    progress(line)
-                match = re.search(r"Success\.\s+Downloaded item\s+(\d+)", line)
-                if match and match.group(1) in targets and match.group(1) not in completed_ids:
-                    completed_ids.add(match.group(1))
-                    report_count()
-            return_code = process.wait()
-            if return_code != 0:
-                downloaded_count = sum(1 for item_id in batch if (downloaded_root / item_id).exists())
-                if downloaded_count == 0:
-                    raise RuntimeError(f"SteamCMD exited with code {return_code} before downloading this batch.")
-                progress(f"SteamCMD exited with code {return_code}, but {downloaded_count}/{len(batch)} mods from this batch are present. Continuing...")
-                completed_ids.update(item_id for item_id in batch if (downloaded_root / item_id).exists())
-            else:
-                # SteamCMD may validate an already-current item without printing a
-                # per-item success line. A successful batch means every item is done.
-                completed_ids.update(batch)
-            report_count()
-        finally:
+    def loadable_ids(item_ids: list[str]) -> set[str]:
+        return {item_id for item_id in item_ids if read_package_id(downloaded_root / item_id)}
+
+    def execute_batches(item_ids: list[str], retry: bool = False) -> bool:
+        detected_error = False
+        batch_size = 40
+        for index in range(0, len(item_ids), batch_size):
+            batch = item_ids[index : index + batch_size]
+            action = "Retrying" if retry else "Downloading/validating"
+            progress(f"{action} batch {index // batch_size + 1}: {len(batch)} mods...")
+            script_lines = ["@ShutdownOnFailedCommand 0", "@NoPromptForPassword 1", "login anonymous"]
+            script_lines.extend(f"workshop_download_item {APP_ID} {item_id} validate" for item_id in batch)
+            script_lines.append("quit")
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as handle:
+                handle.write("\n".join(script_lines))
+                script_path = Path(handle.name)
             try:
-                script_path.unlink()
-            except OSError:
-                pass
+                process = subprocess.Popen(
+                    [str(steamcmd), "+runscript", str(script_path)],
+                    cwd=str(steamcmd_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                )
+                assert process.stdout is not None
+                for line in process.stdout:
+                    line = line.strip()
+                    upper_line = line.upper()
+                    failure_markers = ("ERROR!", "FAILED", "FAILURE", "NO CONNECTION", "TIMED OUT", "TIMEOUT")
+                    line_failed = any(marker in upper_line for marker in failure_markers)
+                    if "SUCCESS. DOWNLOADED ITEM" in upper_line or line_failed:
+                        progress(line)
+                    if line_failed:
+                        detected_error = True
+                        item_match = re.search(r"\bitem\s+(\d+)\b", line, re.IGNORECASE)
+                        if item_match and item_match.group(1) in targets:
+                            failed_item_ids.add(item_match.group(1))
+                    match = re.search(r"Success\.\s+Downloaded item\s+(\d+)", line, re.IGNORECASE)
+                    if match and match.group(1) in targets and match.group(1) not in completed_ids:
+                        completed_ids.add(match.group(1))
+                        report_count()
+                return_code = process.wait()
+                if return_code != 0:
+                    detected_error = True
+                    progress(f"SteamCMD exited with code {return_code}; affected mods will be checked.")
+                completed_ids.update(loadable_ids(batch))
+                report_count()
+            finally:
+                try:
+                    script_path.unlink()
+                except OSError:
+                    pass
+        return detected_error
+
+    error_detected = execute_batches(targets)
+    if error_detected:
+        loadable = loadable_ids(targets)
+        retry_ids = [
+            item_id
+            for item_id in targets
+            if item_id in failed_item_ids or item_id not in loadable
+        ]
+        if retry_ids:
+            progress(
+                f"SteamCMD reported an error. Retrying {len(retry_ids)} affected, missing, or incomplete mod(s)..."
+            )
+            execute_batches(retry_ids, retry=True)
+            loadable = loadable_ids(targets)
+            incomplete = [item_id for item_id in targets if item_id not in loadable]
+            if incomplete:
+                preview = ", ".join(incomplete[:10])
+                suffix = f" and {len(incomplete) - 10} more" if len(incomplete) > 10 else ""
+                raise RuntimeError(
+                    f"{len(incomplete)} SteamCMD mod(s) are still missing or incomplete after retry: "
+                    f"{preview}{suffix}. Check the connection and run Download Missing again."
+                )
+        else:
+            progress("SteamCMD reported an error, but all requested mods passed the presence check.")
 
     return downloaded_root
 
@@ -1301,12 +1387,22 @@ class ProgressorApp(tk.Tk):
         self.minsize(1280, 680)
         self.configure(bg="#101418")
 
-        self.workshop_path = tk.StringVar(value=str(default_workshop_path()))
-        self.local_mods_path = tk.StringVar(value=str(default_rimworld_mods_path()))
-        self.mods_config_path = tk.StringVar(value=str(default_mods_config_path()))
+        saved_settings = load_settings()
+        self.workshop_path = tk.StringVar(
+            value=str(saved_settings.get("workshop_path", default_workshop_path()))
+        )
+        self.local_mods_path = tk.StringVar(
+            value=str(saved_settings.get("local_mods_path", default_rimworld_mods_path()))
+        )
+        self.mods_config_path = tk.StringVar(
+            value=str(saved_settings.get("mods_config_path", default_mods_config_path()))
+        )
         detected_steamcmd = find_steamcmd()
-        self.steamcmd_path = tk.StringVar(value=str(detected_steamcmd) if detected_steamcmd else "")
+        self.steamcmd_path = tk.StringVar(
+            value=str(saved_settings.get("steamcmd_path", detected_steamcmd or ""))
+        )
         self.auto_activate_after_download = BooleanVar(value=True)
+        self.exclude_cosmetics = BooleanVar(value=saved_settings.get("exclude_cosmetics") is True)
         self.current_result: ScanResult | None = None
         self.current_rows: list[tuple[str, str, str, str | None, QuarantinedMod | None]] = []
         self.state_filter = tk.StringVar(value="All states")
@@ -1320,8 +1416,11 @@ class ProgressorApp(tk.Tk):
         self.logo_image: tk.PhotoImage | None = None
         self.progress_bar: ttk.Progressbar | None = None
         self.mod_context_menu: tk.Menu | None = None
+        self.frozen_frame: ttk.Frame | None = None
+        self.frozen_visible = False
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self.close_app)
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self)
@@ -1400,16 +1499,24 @@ class ProgressorApp(tk.Tk):
         paths.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         paths.columnconfigure(1, weight=1)
         ttk.Label(paths, text="Steam Workshop Mods").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(paths, textvariable=self.workshop_path).grid(row=0, column=1, sticky="ew", pady=4)
+        workshop_entry = ttk.Entry(paths, textvariable=self.workshop_path)
+        workshop_entry.grid(row=0, column=1, sticky="ew", pady=4)
+        workshop_entry.bind("<FocusOut>", lambda _event: self.save_configured_paths())
         ttk.Button(paths, text="Browse", command=self.choose_workshop).grid(row=0, column=2, padx=(8, 0), pady=4)
         ttk.Label(paths, text="ModsConfig").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(paths, textvariable=self.mods_config_path).grid(row=1, column=1, sticky="ew", pady=4)
+        mods_config_entry = ttk.Entry(paths, textvariable=self.mods_config_path)
+        mods_config_entry.grid(row=1, column=1, sticky="ew", pady=4)
+        mods_config_entry.bind("<FocusOut>", lambda _event: self.save_configured_paths())
         ttk.Button(paths, text="Browse", command=self.choose_mods_config).grid(row=1, column=2, padx=(8, 0), pady=4)
         ttk.Label(paths, text="Local Mods").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(paths, textvariable=self.local_mods_path).grid(row=2, column=1, sticky="ew", pady=4)
+        local_mods_entry = ttk.Entry(paths, textvariable=self.local_mods_path)
+        local_mods_entry.grid(row=2, column=1, sticky="ew", pady=4)
+        local_mods_entry.bind("<FocusOut>", lambda _event: self.save_configured_paths())
         ttk.Button(paths, text="Browse", command=self.choose_local_mods).grid(row=2, column=2, padx=(8, 0), pady=4)
         ttk.Label(paths, text="SteamCMD").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(paths, textvariable=self.steamcmd_path).grid(row=3, column=1, sticky="ew", pady=4)
+        steamcmd_entry = ttk.Entry(paths, textvariable=self.steamcmd_path)
+        steamcmd_entry.grid(row=3, column=1, sticky="ew", pady=4)
+        steamcmd_entry.bind("<FocusOut>", lambda _event: self.save_configured_paths())
         ttk.Button(paths, text="Browse", command=self.choose_steamcmd).grid(row=3, column=2, padx=(8, 0), pady=4)
         ttk.Button(paths, text="Auto Detect Paths", command=self.auto_detect_paths).grid(row=4, column=2, sticky="e", padx=(8, 0), pady=(8, 0))
         toolbar = ttk.Frame(self.advanced_frame)
@@ -1419,25 +1526,34 @@ class ProgressorApp(tk.Tk):
         ttk.Button(toolbar, text="Update SteamCMD Mods", command=self.update_steamcmd_mods).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Always Enable Selected", command=self.always_enable_selected).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Disable Selected", command=self.disable_selected).pack(side="left", padx=6)
-        ttk.Button(toolbar, text="Freeze Current Setup", command=self.freeze_current_setup).pack(side="left", padx=6)
-        ttk.Button(toolbar, text="Play Frozen", command=self.play_frozen).pack(side="left", padx=6)
-        ttk.Button(toolbar, text="Restore Live Setup", command=self.restore_live_setup).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Activate + Vanilla Sort", command=self.write_config).pack(side="left", padx=6)
         ttk.Checkbutton(toolbar, text="Auto-enable after download", variable=self.auto_activate_after_download).pack(side="left", padx=6)
+        ttk.Checkbutton(
+            toolbar,
+            text="Exclude Cosmetics pack",
+            variable=self.exclude_cosmetics,
+            command=self.cosmetics_setting_changed,
+        ).pack(side="left", padx=6)
+        self.frozen_button = ttk.Button(toolbar, text="Frozen Profiles", command=self.toggle_frozen_options)
+        self.frozen_button.pack(side="left", padx=6)
         ttk.Button(toolbar, text="Launch RimWorld", command=lambda: webbrowser.open(STEAM_RUN_RIMWORLD)).pack(side="right")
 
-        profile_row = ttk.Frame(self.advanced_frame)
-        profile_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
-        ttk.Label(profile_row, text="Frozen Profile").pack(side="left")
+        self.frozen_frame = ttk.Frame(self.advanced_frame, padding=(0, 8, 0, 0))
+        self.frozen_frame.grid(row=2, column=0, sticky="ew")
+        ttk.Label(self.frozen_frame, text="Frozen Profile").pack(side="left")
         self.frozen_profile_combo = ttk.Combobox(
-            profile_row,
+            self.frozen_frame,
             textvariable=self.frozen_profile,
             values=frozen_profile_names(),
             state="readonly",
             width=34,
         )
         self.frozen_profile_combo.pack(side="left", padx=(8, 0))
-        ttk.Button(profile_row, text="Refresh Profiles", command=self.refresh_frozen_profiles).pack(side="left", padx=(8, 0))
+        ttk.Button(self.frozen_frame, text="Refresh Profiles", command=self.refresh_frozen_profiles).pack(side="left", padx=(8, 0))
+        ttk.Button(self.frozen_frame, text="Freeze Current Setup", command=self.freeze_current_setup).pack(side="left", padx=(8, 0))
+        ttk.Button(self.frozen_frame, text="Play Frozen", command=self.play_frozen).pack(side="left", padx=(8, 0))
+        ttk.Button(self.frozen_frame, text="Restore Live Setup", command=self.restore_live_setup).pack(side="left", padx=(8, 0))
+        self.frozen_frame.grid_remove()
 
         main = ttk.PanedWindow(self, orient="horizontal")
         main.grid(row=4, column=0, sticky="nsew", padx=18, pady=(0, 14))
@@ -1597,6 +1713,18 @@ class ProgressorApp(tk.Tk):
         elif not names:
             self.frozen_profile.set("")
 
+    def toggle_frozen_options(self) -> None:
+        self.frozen_visible = not self.frozen_visible
+        if self.frozen_frame is None:
+            return
+        if self.frozen_visible:
+            self.refresh_frozen_profiles()
+            self.frozen_frame.grid()
+            self.frozen_button.configure(text="Hide Frozen Profiles")
+        else:
+            self.frozen_frame.grid_remove()
+            self.frozen_button.configure(text="Frozen Profiles")
+
     def toggle_advanced(self) -> None:
         self.advanced_visible = not self.advanced_visible
         if self.advanced_visible:
@@ -1619,6 +1747,7 @@ class ProgressorApp(tk.Tk):
         path = filedialog.askdirectory(initialdir=self.workshop_path.get() or str(Path.home()))
         if path:
             self.workshop_path.set(path)
+            self.save_configured_paths()
 
     def choose_mods_config(self) -> None:
         path = filedialog.askopenfilename(
@@ -1627,11 +1756,13 @@ class ProgressorApp(tk.Tk):
         )
         if path:
             self.mods_config_path.set(path)
+            self.save_configured_paths()
 
     def choose_local_mods(self) -> None:
         path = filedialog.askdirectory(initialdir=self.local_mods_path.get() or str(Path.home()))
         if path:
             self.local_mods_path.set(path)
+            self.save_configured_paths()
 
     def choose_steamcmd(self) -> None:
         initial = self.steamcmd_path.get()
@@ -1642,6 +1773,32 @@ class ProgressorApp(tk.Tk):
         )
         if path:
             self.steamcmd_path.set(path)
+            self.save_configured_paths()
+
+    def save_configured_paths(self) -> None:
+        try:
+            save_settings(
+                {
+                    "workshop_path": self.workshop_path.get().strip(),
+                    "local_mods_path": self.local_mods_path.get().strip(),
+                    "mods_config_path": self.mods_config_path.get().strip(),
+                    "steamcmd_path": self.steamcmd_path.get().strip(),
+                    "exclude_cosmetics": self.exclude_cosmetics.get(),
+                }
+            )
+        except OSError as exc:
+            self.progress(f"Could not save paths: {exc}")
+
+    def close_app(self) -> None:
+        self.save_configured_paths()
+        self.destroy()
+
+    def cosmetics_setting_changed(self) -> None:
+        self.save_configured_paths()
+        state = "excluded" if self.exclude_cosmetics.get() else "included"
+        self.progress(f"Cosmetics pack is now {state}.")
+        if self.current_result is not None:
+            self.start_scan()
 
     def auto_detect_paths(self) -> None:
         self.workshop_path.set(str(default_workshop_path()))
@@ -1649,6 +1806,7 @@ class ProgressorApp(tk.Tk):
         self.mods_config_path.set(str(default_mods_config_path()))
         detected_steamcmd = find_steamcmd()
         self.steamcmd_path.set(str(detected_steamcmd) if detected_steamcmd else "")
+        self.save_configured_paths()
         self.progress("Auto-detected paths from Steam libraries and standard RimWorld config locations.")
 
     def auto_detect_invalid_paths(self) -> None:
@@ -1676,6 +1834,7 @@ class ProgressorApp(tk.Tk):
                 detected.append("SteamCMD")
 
         if detected:
+            self.save_configured_paths()
             self.progress(f"Play Now auto-detected invalid or missing paths: {', '.join(detected)}.")
 
     def run_worker(self, target) -> None:
@@ -1722,11 +1881,13 @@ class ProgressorApp(tk.Tk):
         self.run_worker(wrapped)
 
     def scan_paths(self, progress) -> ScanResult:
+        self.save_configured_paths()
         return scan(
             Path(self.workshop_path.get()),
             Path(self.local_mods_path.get()),
             Path(self.mods_config_path.get()),
             progress,
+            exclude_cosmetics=self.exclude_cosmetics.get(),
         )
 
     def play_now(self) -> None:
@@ -1850,6 +2011,19 @@ class ProgressorApp(tk.Tk):
         if not selected:
             messagebox.showinfo("Select mods", "Select one or more mods in the table first.")
             return
+        if self.exclude_cosmetics.get():
+            cosmetic_selected = selected & cached_cosmetic_ids()
+            selected.difference_update(cosmetic_selected)
+            if cosmetic_selected:
+                self.progress(
+                    f"Skipped {len(cosmetic_selected)} cosmetic mod(s) because Cosmetics exclusion is enabled."
+                )
+            if not selected:
+                messagebox.showinfo(
+                    "Cosmetics excluded",
+                    "Turn off Exclude Cosmetics pack before marking cosmetic mods as Always Enabled.",
+                )
+                return
         always_enabled = load_always_enabled_ids()
         always_enabled.update(selected)
         save_always_enabled_ids(always_enabled)
@@ -1928,6 +2102,13 @@ class ProgressorApp(tk.Tk):
                     Path(self.mods_config_path.get()),
                     self.progress,
                 )
+                if self.exclude_cosmetics.get():
+                    excluded_profile_ids = profile_ids & cached_cosmetic_ids()
+                    profile_ids.difference_update(excluded_profile_ids)
+                    if excluded_profile_ids:
+                        self.progress(
+                            f"Cosmetics exclusion disabled {len(excluded_profile_ids)} mod(s) from the frozen profile."
+                        )
                 result = self.scan_paths(self.progress)
                 result.always_enabled_ids = set(profile_ids)
                 self.current_result = result
