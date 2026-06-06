@@ -2,6 +2,8 @@
 
 Windows-first helper for launching Ferny's Progression RimWorld modpack.
 
+[**Download Progression Launcher for Windows**](https://sebo2203.github.io/ProgressionLauncher/?v=0.3.4)
+
 Progression Launcher fetches Ferny's live Steam Workshop collections, compares them against your Steam Workshop folder and RimWorld local `Mods` folder, downloads missing items through SteamCMD, writes a backed-up `ModsConfig.xml`, and launches RimWorld through Steam.
 
 ## Run
