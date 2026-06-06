@@ -1297,7 +1297,7 @@ class ProgressorApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1540x800")
+        self.geometry("1580x800")
         self.minsize(1280, 680)
         self.configure(bg="#101418")
 
@@ -1319,6 +1319,7 @@ class ProgressorApp(tk.Tk):
         self.advanced_visible = False
         self.logo_image: tk.PhotoImage | None = None
         self.progress_bar: ttk.Progressbar | None = None
+        self.mod_context_menu: tk.Menu | None = None
 
         self._build_ui()
 
@@ -1398,7 +1399,7 @@ class ProgressorApp(tk.Tk):
         paths = ttk.LabelFrame(self.advanced_frame, text="Paths", padding=12)
         paths.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         paths.columnconfigure(1, weight=1)
-        ttk.Label(paths, text="Workshop").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(paths, text="Steam Workshop Mods").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(paths, textvariable=self.workshop_path).grid(row=0, column=1, sticky="ew", pady=4)
         ttk.Button(paths, text="Browse", command=self.choose_workshop).grid(row=0, column=2, padx=(8, 0), pady=4)
         ttk.Label(paths, text="ModsConfig").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
@@ -1422,7 +1423,7 @@ class ProgressorApp(tk.Tk):
         ttk.Button(toolbar, text="Play Frozen", command=self.play_frozen).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Restore Live Setup", command=self.restore_live_setup).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Activate + Vanilla Sort", command=self.write_config).pack(side="left", padx=6)
-        ttk.Checkbutton(toolbar, text="Auto-activate after download", variable=self.auto_activate_after_download).pack(side="left", padx=6)
+        ttk.Checkbutton(toolbar, text="Auto-enable after download", variable=self.auto_activate_after_download).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Launch RimWorld", command=lambda: webbrowser.open(STEAM_RUN_RIMWORLD)).pack(side="right")
 
         profile_row = ttk.Frame(self.advanced_frame)
@@ -1502,6 +1503,23 @@ class ProgressorApp(tk.Tk):
         tree_scroll = ttk.Scrollbar(right, orient="vertical", command=self.tree.yview)
         tree_scroll.grid(row=2, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=tree_scroll.set)
+        self.tree.bind("<Button-3>", self.show_mod_context_menu)
+        self.mod_context_menu = tk.Menu(
+            self,
+            tearoff=False,
+            bg="#171d22",
+            fg="#eef3ef",
+            activebackground="#2d4b55",
+            activeforeground="#ffffff",
+        )
+        self.mod_context_menu.add_command(
+            label="Open Steam Workshop Page",
+            command=self.open_selected_workshop_page,
+        )
+        self.mod_context_menu.add_command(
+            label="Copy Workshop URL",
+            command=self.copy_selected_workshop_url,
+        )
         main.add(right, weight=2)
 
         self.refresh_frozen_profiles()
@@ -1535,6 +1553,40 @@ class ProgressorApp(tk.Tk):
             for item in self.tree.selection()
             if item in self.row_item_ids
         }
+
+    def selected_workshop_item_id(self) -> str | None:
+        for row_id in self.tree.selection():
+            item_id = self.row_item_ids.get(row_id)
+            if item_id:
+                return item_id
+        return None
+
+    def show_mod_context_menu(self, event: tk.Event) -> None:
+        row_id = self.tree.identify_row(event.y)
+        if not row_id or row_id not in self.row_item_ids:
+            return
+        self.tree.selection_set(row_id)
+        self.tree.focus(row_id)
+        if self.mod_context_menu is not None:
+            try:
+                self.mod_context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.mod_context_menu.grab_release()
+
+    def open_selected_workshop_page(self) -> None:
+        item_id = self.selected_workshop_item_id()
+        if item_id:
+            webbrowser.open(WORKSHOP_URL.format(id=item_id))
+
+    def copy_selected_workshop_url(self) -> None:
+        item_id = self.selected_workshop_item_id()
+        if not item_id:
+            return
+        url = WORKSHOP_URL.format(id=item_id)
+        self.clipboard_clear()
+        self.clipboard_append(url)
+        self.update()
+        self.progress(f"Copied Workshop URL for {item_id}.")
 
     def refresh_frozen_profiles(self) -> None:
         names = frozen_profile_names()
@@ -1771,13 +1823,11 @@ class ProgressorApp(tk.Tk):
             package_id = result.installed_package_ids.get(item_id, "")
             label = f"{item_id}  {package_id}" if package_id else item_id
             rows.append((state, source, label, item_id, None))
-        for item_id in result.ready_ids[:300]:
+        for item_id in result.ready_ids:
             item = result.required[item_id]
             source = "Local" if item_id in result.local_steamcmd_ids else item.collection
             state = "Always Enabled" if item_id in result.always_enabled_ids else "Enabled"
             rows.append((state, source, f"{item_id}  {item.title}", item_id, None))
-        if len(result.ready_ids) > 300:
-            rows.append(("Enabled", "...", f"{len(result.ready_ids) - 300} more installed required mods hidden", None, None))
         self.set_mod_rows(rows)
 
     def show_quarantine(self) -> None:
