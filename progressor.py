@@ -981,7 +981,12 @@ def relocate_unregistered_workshop_mods(result: ScanResult, targets: list[str], 
     return moved
 
 
-def run_steamcmd_downloads(result: ScanResult, progress, targets: list[str] | None = None) -> Path:
+def run_steamcmd_downloads(
+    result: ScanResult,
+    progress,
+    targets: list[str] | None = None,
+    progress_count=None,
+) -> Path:
     steamcmd = find_steamcmd()
     if not steamcmd:
         raise RuntimeError(
@@ -992,7 +997,18 @@ def run_steamcmd_downloads(result: ScanResult, progress, targets: list[str] | No
     if not targets:
         raise RuntimeError("There are no SteamCMD mods to download or validate.")
 
+    total = len(targets)
+    completed_ids: set[str] = set()
+
+    def report_count() -> None:
+        completed = len(completed_ids)
+        remaining = max(total - completed, 0)
+        progress(f"SteamCMD progress: {completed}/{total} complete, {remaining} remaining.")
+        if progress_count is not None:
+            progress_count(completed, total)
+
     progress(f"Using SteamCMD: {steamcmd}")
+    report_count()
     steamcmd_root = steamcmd.parent
     relocate_unregistered_workshop_mods(result, targets, progress)
     downloaded_root = prepare_steamcmd_local_download_root(steamcmd_root, result.local_mods_path, progress)
@@ -1023,12 +1039,22 @@ def run_steamcmd_downloads(result: ScanResult, progress, targets: list[str] | No
                 line = line.strip()
                 if "Success. Downloaded item" in line or "ERROR!" in line or "FAILED" in line:
                     progress(line)
+                match = re.search(r"Success\.\s+Downloaded item\s+(\d+)", line)
+                if match and match.group(1) in targets and match.group(1) not in completed_ids:
+                    completed_ids.add(match.group(1))
+                    report_count()
             return_code = process.wait()
             if return_code != 0:
                 downloaded_count = sum(1 for item_id in batch if (downloaded_root / item_id).exists())
                 if downloaded_count == 0:
                     raise RuntimeError(f"SteamCMD exited with code {return_code} before downloading this batch.")
                 progress(f"SteamCMD exited with code {return_code}, but {downloaded_count}/{len(batch)} mods from this batch are present. Continuing...")
+                completed_ids.update(item_id for item_id in batch if (downloaded_root / item_id).exists())
+            else:
+                # SteamCMD may validate an already-current item without printing a
+                # per-item success line. A successful batch means every item is done.
+                completed_ids.update(batch)
+            report_count()
         finally:
             try:
                 script_path.unlink()
@@ -1607,12 +1633,27 @@ class ProgressorApp(tk.Tk):
         self.play_button.configure(state="disabled", text=message.upper())
         self.busy_message.set(message)
         if self.progress_bar is not None:
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="indeterminate", value=0)
             self.progress_bar.grid()
             self.progress_bar.start(12)
+
+    def update_busy_download_progress(self, completed: int, total: int) -> None:
+        def apply() -> None:
+            remaining = max(total - completed, 0)
+            if self.progress_bar is not None:
+                self.progress_bar.stop()
+                self.progress_bar.configure(mode="determinate", maximum=max(total, 1), value=completed)
+                self.progress_bar.grid()
+            self.busy_message.set(f"{completed} of {total} mods complete - {remaining} remaining")
+            self.play_button.configure(text=f"{completed}/{total} MODS")
+
+        self.after(0, apply)
 
     def clear_busy(self) -> None:
         if self.progress_bar is not None:
             self.progress_bar.stop()
+            self.progress_bar.configure(mode="indeterminate", value=0)
             self.progress_bar.grid_remove()
         self.busy_message.set("")
         self.play_button.configure(state="normal", text="PLAY NOW")
@@ -1655,7 +1696,11 @@ class ProgressorApp(tk.Tk):
                 pending_downloads = download_target_ids(result)
                 if pending_downloads:
                     self.progress(f"{len(pending_downloads)} mods need SteamCMD local download. Downloading...")
-                    run_steamcmd_downloads(result, self.progress)
+                    run_steamcmd_downloads(
+                        result,
+                        self.progress,
+                        progress_count=self.update_busy_download_progress,
+                    )
                     result = self.scan_paths(self.progress)
                     self.current_result = result
                     self.after(0, lambda: self.render_result(result))
@@ -1974,7 +2019,12 @@ class ProgressorApp(tk.Tk):
                 if not should_update.is_set():
                     self.progress("SteamCMD update cancelled.")
                     return
-                run_steamcmd_downloads(result, self.progress, targets=outdated)
+                run_steamcmd_downloads(
+                    result,
+                    self.progress,
+                    targets=outdated,
+                    progress_count=self.update_busy_download_progress,
+                )
                 self.progress("SteamCMD update step complete. Scanning again...")
                 fresh_result = self.scan_paths(self.progress)
                 self.current_result = fresh_result
@@ -2013,7 +2063,11 @@ class ProgressorApp(tk.Tk):
                 old_env = os.environ.get("STEAMCMD")
                 if steamcmd:
                     os.environ["STEAMCMD"] = steamcmd
-                run_steamcmd_downloads(result, self.progress)
+                run_steamcmd_downloads(
+                    result,
+                    self.progress,
+                    progress_count=self.update_busy_download_progress,
+                )
                 self.progress("Download step complete. Scanning again...")
                 fresh_result = self.scan_paths(self.progress)
                 self.current_result = fresh_result
