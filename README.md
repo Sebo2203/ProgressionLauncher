@@ -2,9 +2,32 @@
 
 Windows-first helper for launching Ferny's Progression RimWorld modpack.
 
-[**Download Progression Launcher for Windows**](https://sebo2203.github.io/ProgressionLauncher/?v=0.3.4)
+[**Download Progression Launcher v0.4.0 for Windows**](https://sebo2203.github.io/ProgressionLauncher/?v=0.4.0)
 
 Progression Launcher fetches Ferny's live Steam Workshop collections, compares them against your Steam Workshop folder and RimWorld local `Mods` folder, downloads missing items through SteamCMD, writes a backed-up `ModsConfig.xml`, and launches RimWorld through Steam.
+
+## Requirements
+
+- Windows 10 or Windows 11
+- RimWorld installed through Steam
+- An internet connection
+- [SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD)
+
+SteamCMD is required for downloading mods that the Steam client has not made loadable. If it is missing when a SteamCMD operation begins, Progression Launcher downloads the official Windows package directly from Valve and configures it automatically. You can also install it ahead of time with `Show Advanced Options` > `Install SteamCMD`.
+
+You can also install SteamCMD manually:
+
+1. Download Valve's official [`steamcmd.zip`](https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip).
+2. Extract it into a permanent folder such as `C:\SteamCMD`.
+3. Press `Auto Detect Paths`, or use the SteamCMD `Browse` button and select the extracted `steamcmd.exe`.
+
+The displayed SteamCMD path should be a complete path such as:
+
+```text
+C:\SteamCMD\steamcmd.exe
+```
+
+Progression Launcher does not bundle or redistribute SteamCMD. The one-click installer downloads the current package directly from Valve so Valve remains the source of the executable and can provide its current version.
 
 ## Run
 
@@ -64,7 +87,9 @@ C:\Program Files (x86)\Steam\steamapps\common\RimWorld\Mods
 - `Download Missing`: uses SteamCMD to install missing or non-loadable mods into RimWorld's local `Mods` folder.
 - `Update SteamCMD Mods`: compares SteamCMD-local Ferny mods against Steam update metadata, then validates/downloads only mods with newer Workshop versions.
 - `Always Enable Selected`: pins selected installed mods so they stay active even if they are not part of Ferny's pack.
-- `Disable Selected`: removes selected mods from the always-enabled list.
+- `Reset Selected`: removes the selected mods' launcher override and follows Ferny's current pack status.
+- `Always Disable Selected`: keeps selected mods disabled even when they are part of Ferny's pack.
+- `Install SteamCMD`: downloads the current official SteamCMD package from Valve into the launcher's AppData folder.
 - `Freeze Current Setup`: copies the current active setup and RimWorld config files into an independent frozen profile.
 - `Play Frozen`: stages the selected frozen profile and launches RimWorld from those copied mod folders/config files.
 - `Restore Live Setup`: restores live Steam/SteamCMD folders after playing a frozen profile.
@@ -94,6 +119,8 @@ SteamCMD mode is supported by making SteamCMD download directly into RimWorld's 
 to RimWorld's local `Mods` folder. If that SteamCMD content folder already contains old downloads, Progression Launcher moves numeric mod folders into local `Mods` and backs up any remaining folder before creating the junction.
 
 Steam-subscribed Workshop mods are left to Steam's own update system.
+
+SteamCMD is normally detected from the configured `STEAMCMD` environment variable, the system `PATH`, the launcher folder, the launcher's AppData installation, and common standalone, Scoop, and Chocolatey installation locations. Manually selected paths are stored as fully resolved absolute paths.
 
 ## Safety
 
