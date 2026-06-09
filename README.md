@@ -2,7 +2,7 @@
 
 Windows-first helper for launching Ferny's Progression RimWorld modpack.
 
-[**Download Progression Launcher v0.4.1 for Windows**](https://sebo2203.github.io/ProgressionLauncher/?v=0.4.1)
+[**Download Progression Launcher v0.4.2 for Windows**](https://sebo2203.github.io/ProgressionLauncher/?v=0.4.2)
 
 Progression Launcher fetches Ferny's live Steam Workshop collections, compares them against your Steam Workshop folder and RimWorld local `Mods` folder, downloads missing items through SteamCMD, writes a backed-up `ModsConfig.xml`, and launches RimWorld through Steam.
 
@@ -65,9 +65,21 @@ No third-party Python packages are required.
 
 Use `Show Advanced Options` for troubleshooting, manual paths, selecting always-enabled mods, frozen profiles, or running individual steps manually.
 
+The mod table includes a live approximate-name search. Typing filters non-matching rows, selects the strongest match, and scrolls it into view. It also works in the `Active Load Order` view.
+
+When frozen profiles exist, the selected profile is also available directly beneath `PLAY NOW`. The launcher remembers that selection between restarts. Hover over the adjacent `?` for a summary of the difference between live and frozen play.
+
 ## Paths
 
 The app auto-detects Steam libraries, RimWorld's local `Mods` folder, SteamCMD, and RimWorld's `ModsConfig.xml` on startup. You can still edit every path manually under `Show Advanced Options`.
+
+Frozen profiles default to:
+
+```text
+%LOCALAPPDATA%\ProgressionLauncher\frozen_profiles
+```
+
+The `Frozen Profiles` path can point to another local drive or folder. Changing it switches where profiles are listed and created; existing profiles are not moved automatically.
 
 Typical Steam Workshop folder:
 
@@ -90,19 +102,27 @@ C:\Program Files (x86)\Steam\steamapps\common\RimWorld\Mods
 - `Reset Selected`: removes the selected mods' launcher override and follows Ferny's current pack status.
 - `Always Disable Selected`: keeps selected mods disabled even when they are part of Ferny's pack.
 - `Install SteamCMD`: downloads the current official SteamCMD package from Valve into the launcher's AppData folder.
-- `Freeze Current Setup`: copies the active mods, game version, saves, settings, and mod data into an independent frozen profile.
+- `Freeze Current Setup`: lets you choose the saves to preserve, estimates the required space, then copies the active mods, game version, settings, and persistent mod data into an independent frozen profile.
 - `Play Frozen`: validates and launches the selected profile with its private game, mods, and user-data folder.
 - `Remove Selected`: permanently deletes the selected frozen profile and its copied game, mods, settings, and saves.
-- `Activate + Vanilla Sort`: backs up `ModsConfig.xml`, activates Ferny mods plus always-enabled mods, and sorts them using RimWorld-style metadata rules.
+- `Remove Incomplete Copies`: finds temporary `.creating_*` folders left behind by interrupted freezes, reports their combined size, and removes them after confirmation.
+- `Apply Mod List + Sort`: backs up `ModsConfig.xml`, applies Ferny mods plus your always-enabled/disabled choices, and sorts them using RimWorld-style metadata rules.
 - `Launch RimWorld`: opens RimWorld through Steam.
 
 ## Frozen Profiles
 
-New frozen profiles are self-contained historical snapshots intended for saves that must survive later pack, mod, configuration, and RimWorld updates. A full profile copies:
+New frozen profiles are self-contained historical snapshots intended for saves that must survive later pack, mod, configuration, and RimWorld updates. A compact profile copies:
 
 - the exact mods active in `ModsConfig.xml`, in that saved load order
 - the current RimWorld game files and DLC data
-- the entire RimWorld user-data folder, including saves, settings, scenarios, ideologies, xenotypes, and mod-owned data
+- the saves selected during profile creation and their matching `.old` backups
+- settings, scenarios, ideologies, xenotypes, presets, and ordinary mod-owned persistent data
+
+Known disposable data is excluded: unrelated saves and backups, logs, RealRuins downloads, RocketMan data, MissileGirl cache data, startup-impact data, and developer output. The launcher shows estimated game, mod, and compact user-data sizes plus destination free space before copying.
+
+Frozen profiles use a hidden shared immutable mod snapshot store inside the configured `Frozen Profiles` folder. The first profile stores each exact active mod version once. Later profiles hard-link unchanged versions from that store, preserving independent historical loadouts without consuming another full physical copy of the modpack. The confirmation distinguishes logical mod size from new shared storage actually required. Windows may still display the full logical folder size for hard-linked files even though their physical disk blocks are shared.
+
+Removing a profile also removes stored mod versions that are no longer referenced by any remaining profile. The copied RimWorld game version and compact user data remain private to each profile.
 
 `Play Frozen` validates every snapshotted mod with an on-screen remaining count and launches the copied historical RimWorld executable directly with RimWorld's `-savedatafolder` option pointed at the profile's private user-data folder. It does not move or modify the live setup, fetch Ferny's current collections, re-sort the profile, apply Cosmetics exclusion, or expose the copied game/mod folders to Steam Workshop updates. Frozen saves stay outside Steam Cloud's normal live save location.
 
@@ -110,7 +130,7 @@ Changes made during a frozen session are written directly into that profile. Nor
 
 Profiles created by older launcher versions are not compatible with the full snapshot format. Remove them with `Remove Selected` and create a new profile.
 
-Full frozen profiles can consume many gigabytes because active mods, the game installation, saves, and configuration are physical independent copies. Keep backups of important profiles on another drive; the launcher cannot protect against disk failure or manual profile deletion.
+The first shared snapshot can still consume many gigabytes because it must preserve the full active modpack once. Later profiles generally need only changed mod versions, another game snapshot, and their compact user data. Keep backups of important profiles on another drive; the launcher cannot protect against disk failure or manual profile deletion.
 
 ## SteamCMD Note
 

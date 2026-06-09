@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import datetime as _dt
 import concurrent.futures
+import difflib
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,7 +28,7 @@ import tkinter as tk
 
 APP_ID = "294100"
 APP_NAME = "Progression Launcher"
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.4.2"
 COLLECTIONS = {
     "Core": "3521297585",
     "Content": "3521319712",
@@ -64,7 +66,8 @@ CACHE_PATH = app_data_dir() / "collection_cache.json"
 BUNDLED_CACHE_PATH = asset_path("collection_cache.json")
 ALWAYS_ENABLED_PATH = app_data_dir() / "always_enabled.json"
 DISABLED_MODS_PATH = app_data_dir() / "disabled_mods.json"
-FROZEN_PROFILES_PATH = app_data_dir() / "frozen_profiles"
+DEFAULT_FROZEN_PROFILES_PATH = app_data_dir() / "frozen_profiles"
+FROZEN_PROFILES_PATH = DEFAULT_FROZEN_PROFILES_PATH
 SETTINGS_PATH = app_data_dir() / "settings.json"
 LOCAL_METADATA_CACHE_PATH = app_data_dir() / "local_metadata_cache.json"
 SORT_CACHE_PATH = app_data_dir() / "sort_cache.json"
@@ -130,6 +133,16 @@ class FrozenStageResult:
     item_ids: set[str]
     executable_path: Path
     user_data_path: Path
+
+
+@dataclass(frozen=True)
+class ModSnapshotPlan:
+    item_id: str
+    source: Path
+    version_key: str
+    snapshot_path: Path
+    logical_size: int
+    reusable: bool
 
 
 def steam_root_candidates() -> list[Path]:
@@ -591,7 +604,14 @@ def load_settings() -> dict[str, object]:
     if not isinstance(payload, dict):
         return {}
     settings: dict[str, object] = {}
-    for key in {"workshop_path", "local_mods_path", "mods_config_path", "steamcmd_path"}:
+    for key in {
+        "workshop_path",
+        "local_mods_path",
+        "mods_config_path",
+        "steamcmd_path",
+        "frozen_profiles_path",
+        "selected_frozen_profile",
+    }:
         value = payload.get(key)
         if value:
             settings[key] = str(value)
@@ -619,6 +639,43 @@ def safe_profile_name(name: str) -> str:
     return cleaned[:80]
 
 
+def normalize_frozen_profiles_path(raw_path: str | Path | None) -> Path:
+    if not raw_path:
+        return DEFAULT_FROZEN_PROFILES_PATH
+    text = os.path.expandvars(os.path.expanduser(str(raw_path).strip().strip('"')))
+    if not text:
+        return DEFAULT_FROZEN_PROFILES_PATH
+    return Path(text).resolve()
+
+
+def configure_frozen_profiles_path(raw_path: str | Path | None) -> Path:
+    global FROZEN_PROFILES_PATH
+    FROZEN_PROFILES_PATH = normalize_frozen_profiles_path(raw_path)
+    return FROZEN_PROFILES_PATH
+
+
+def mod_search_score(query: str, searchable_text: str) -> float:
+    query = " ".join(query.lower().split())
+    text = " ".join(searchable_text.lower().split())
+    if not query:
+        return 1.0
+    if query in text:
+        return 2.0 + len(query) / max(len(text), 1)
+    query_tokens = query.split()
+    if query_tokens and all(token in text for token in query_tokens):
+        return 1.5
+    if len(query) < 3:
+        return 0.0
+    words = re.findall(r"[a-z0-9]+", text)
+    candidates = [text, *words]
+    if len(words) > 1:
+        candidates.extend(" ".join(words[index : index + len(query_tokens)]) for index in range(len(words)))
+    return max(
+        (difflib.SequenceMatcher(None, query, candidate).ratio() for candidate in candidates if candidate),
+        default=0.0,
+    )
+
+
 def frozen_profile_names() -> list[str]:
     if not FROZEN_PROFILES_PATH.exists():
         return []
@@ -626,6 +683,264 @@ def frozen_profile_names() -> list[str]:
         [child.name for child in FROZEN_PROFILES_PATH.iterdir() if child.is_dir() and (child / "manifest.json").exists()],
         key=str.lower,
     )
+
+
+def incomplete_frozen_profile_paths() -> list[Path]:
+    if not FROZEN_PROFILES_PATH.exists():
+        return []
+    incomplete = [
+        child
+        for child in FROZEN_PROFILES_PATH.iterdir()
+        if child.is_dir() and child.name.startswith(".creating_")
+    ]
+    store_root = frozen_snapshot_store_path()
+    if store_root.exists():
+        incomplete.extend(
+            path
+            for path in store_root.glob("*/*")
+            if path.is_dir() and path.name.startswith(".creating_")
+        )
+    return sorted(incomplete, key=lambda path: str(path).lower())
+
+
+def frozen_snapshot_store_path() -> Path:
+    return FROZEN_PROFILES_PATH / ".snapshot_store" / "mods"
+
+
+def directory_size_bytes(path: Path) -> int:
+    total = 0
+    for root, _directories, files in os.walk(path):
+        for filename in files:
+            try:
+                total += (Path(root) / filename).stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def remove_tree(path: Path) -> None:
+    def clear_readonly(func, target, _exc_info) -> None:
+        os.chmod(target, stat.S_IWRITE)
+        func(target)
+
+    shutil.rmtree(path, onexc=clear_readonly)
+
+
+def format_file_size(size_bytes: int) -> str:
+    size = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.2f} {unit}" if unit in {"GB", "TB"} else f"{size:.0f} {unit}"
+        size /= 1024
+    return f"{size_bytes} B"
+
+
+COMPACT_USER_DATA_ROOT_EXCLUSIONS = {
+    "RealRuins",
+    "RocketMan",
+    "DevOutput",
+    "Player.log",
+    "Player-prev.log",
+    "RimMon_Log.txt",
+    "StartupImpactData.xml",
+    "steam_autocloud.vdf",
+}
+
+
+def available_rimworld_saves(user_data_root: Path) -> list[Path]:
+    saves_root = user_data_root / "Saves"
+    if not saves_root.is_dir():
+        return []
+    return sorted(
+        [path for path in saves_root.iterdir() if path.is_file() and path.suffix.lower() == ".rws"],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def selected_save_files(user_data_root: Path, selected_save_names: list[str]) -> set[str]:
+    saves_root = user_data_root / "Saves"
+    selected: set[str] = set()
+    for raw_name in selected_save_names:
+        name = Path(raw_name).name
+        if name.lower().endswith(".rws") and (saves_root / name).is_file():
+            selected.add(name)
+            backup_name = f"{name}.old"
+            if (saves_root / backup_name).is_file():
+                selected.add(backup_name)
+    return selected
+
+
+def compact_user_data_ignore(
+    user_data_root: Path,
+    selected_save_names: list[str],
+):
+    selected_files = selected_save_files(user_data_root, selected_save_names)
+    root_resolved = user_data_root.resolve()
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        current = Path(directory).resolve()
+        if current == root_resolved:
+            return {name for name in names if name in COMPACT_USER_DATA_ROOT_EXCLUSIONS}
+        if current == (root_resolved / "Saves"):
+            return {name for name in names if name not in selected_files}
+        if current == (root_resolved / "MissileGirl"):
+            return {name for name in names if name.lower() == "cache"}
+        return set()
+
+    return ignore
+
+
+def filtered_directory_size_bytes(path: Path, ignore) -> int:
+    total = 0
+    for root, directories, files in os.walk(path):
+        ignored = ignore(root, [*directories, *files])
+        directories[:] = [name for name in directories if name not in ignored]
+        for filename in files:
+            if filename in ignored:
+                continue
+            try:
+                total += (Path(root) / filename).stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def mod_snapshot_plan(item_id: str, source: Path) -> ModSnapshotPlan:
+    digest = hashlib.sha256()
+    logical_size = 0
+    for root, directories, files in os.walk(source):
+        directories.sort(key=str.lower)
+        files.sort(key=str.lower)
+        root_path = Path(root)
+        for filename in files:
+            path = root_path / filename
+            try:
+                stat_result = path.stat()
+            except OSError:
+                continue
+            relative = path.relative_to(source).as_posix()
+            logical_size += stat_result.st_size
+            digest.update(relative.encode("utf-8", errors="surrogatepass"))
+            digest.update(b"\0")
+            digest.update(str(stat_result.st_size).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(stat_result.st_mtime_ns).encode("ascii"))
+            digest.update(b"\n")
+    version_key = digest.hexdigest()[:24]
+    snapshot_path = frozen_snapshot_store_path() / item_id / version_key
+    reusable = snapshot_path.is_dir() and (snapshot_path / ".snapshot_complete.json").is_file()
+    return ModSnapshotPlan(item_id, source, version_key, snapshot_path, logical_size, reusable)
+
+
+def plan_mod_snapshots(result: ScanResult, active_ids: list[str]) -> list[ModSnapshotPlan]:
+    return [mod_snapshot_plan(item_id, result.item_paths[item_id]) for item_id in active_ids]
+
+
+def make_tree_readonly(path: Path) -> None:
+    for root, _directories, files in os.walk(path):
+        for filename in files:
+            try:
+                os.chmod(Path(root) / filename, stat.S_IREAD)
+            except OSError:
+                continue
+
+
+def ensure_mod_snapshot(plan: ModSnapshotPlan) -> Path:
+    if plan.reusable and plan.snapshot_path.is_dir():
+        return plan.snapshot_path
+    parent = plan.snapshot_path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    temporary = parent / f".creating_{plan.version_key}_{timestamp()}"
+    try:
+        shutil.copytree(plan.source, temporary)
+        marker = {
+            "item_id": plan.item_id,
+            "version_key": plan.version_key,
+            "logical_size": plan.logical_size,
+            "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        }
+        (temporary / ".snapshot_complete.json").write_text(
+            json.dumps(marker, indent=2),
+            encoding="utf-8",
+        )
+        make_tree_readonly(temporary)
+        if plan.snapshot_path.exists():
+            remove_tree(plan.snapshot_path)
+        temporary.rename(plan.snapshot_path)
+        return plan.snapshot_path
+    except Exception:
+        if temporary.exists():
+            try:
+                remove_tree(temporary)
+            except OSError:
+                pass
+        raise
+
+
+def hardlink_snapshot_tree(source: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=False)
+    for root, directories, files in os.walk(source):
+        relative_root = Path(root).relative_to(source)
+        target_root = target / relative_root
+        for directory in directories:
+            (target_root / directory).mkdir(exist_ok=True)
+        for filename in files:
+            if filename == ".snapshot_complete.json":
+                continue
+            source_file = Path(root) / filename
+            target_file = target_root / filename
+            try:
+                os.link(source_file, target_file)
+            except OSError:
+                shutil.copy2(source_file, target_file)
+
+
+def referenced_snapshot_paths() -> set[Path]:
+    references: set[Path] = set()
+    for profile_name in frozen_profile_names():
+        try:
+            manifest = load_frozen_manifest(profile_name)
+        except RuntimeError:
+            continue
+        for entry in manifest.get("mods", []):
+            if not isinstance(entry, dict):
+                continue
+            relative = entry.get("snapshot")
+            if isinstance(relative, str) and relative:
+                references.add((FROZEN_PROFILES_PATH / relative).resolve())
+    return references
+
+
+def cleanup_unreferenced_mod_snapshots(progress=None) -> tuple[int, int]:
+    store_root = frozen_snapshot_store_path()
+    if not store_root.exists():
+        return 0, 0
+    references = referenced_snapshot_paths()
+    removed = 0
+    reclaimed = 0
+    for item_root in list(store_root.iterdir()):
+        if not item_root.is_dir():
+            continue
+        for version_root in list(item_root.iterdir()):
+            if not version_root.is_dir() or version_root.name.startswith(".creating_"):
+                continue
+            if version_root.resolve() in references:
+                continue
+            size = directory_size_bytes(version_root)
+            remove_tree(version_root)
+            removed += 1
+            reclaimed += size
+        try:
+            item_root.rmdir()
+        except OSError:
+            pass
+    if progress and removed:
+        progress(
+            f"Removed {removed} unreferenced shared mod snapshot(s), reclaiming "
+            f"{format_file_size(reclaimed)}."
+        )
+    return removed, reclaimed
 
 
 def frozen_profile_path(profile_name: str) -> Path:
@@ -1071,9 +1386,43 @@ def copy_rimworld_game_snapshot(game_root: Path, target: Path, progress) -> None
     (target / "Mods").mkdir(parents=True, exist_ok=True)
 
 
+def estimate_frozen_profile_size(
+    result: ScanResult,
+    active_ids: list[str],
+    selected_save_names: list[str],
+) -> tuple[int, int, int, int, list[ModSnapshotPlan]]:
+    game_root = result.local_mods_path.parent
+
+    def ignore_live_mods(directory: str, names: list[str]) -> set[str]:
+        if Path(directory).resolve() != game_root.resolve():
+            return set()
+        return {
+            name
+            for name in names
+            if name.lower() == "mods" or name.lower().startswith("mods - ")
+        }
+
+    game_size = filtered_directory_size_bytes(game_root, ignore_live_mods)
+    snapshot_plans = plan_mod_snapshots(result, active_ids)
+    mods_size = sum(plan.logical_size for plan in snapshot_plans)
+    new_mod_storage = sum(plan.logical_size for plan in snapshot_plans if not plan.reusable)
+    user_data_root = result.mods_config_path.parent.parent
+    user_data_size = (
+        filtered_directory_size_bytes(
+            user_data_root,
+            compact_user_data_ignore(user_data_root, selected_save_names),
+        )
+        if user_data_root.exists()
+        else 0
+    )
+    return game_size, mods_size, new_mod_storage, user_data_size, snapshot_plans
+
+
 def create_frozen_profile(
     result: ScanResult,
     profile_name: str,
+    selected_save_names: list[str],
+    snapshot_plans: list[ModSnapshotPlan],
     progress,
     progress_count=None,
 ) -> Path:
@@ -1097,12 +1446,16 @@ def create_frozen_profile(
         total = len(active_ids)
         if progress_count is not None:
             progress_count(0, total)
+        plans_by_id = {plan.item_id: plan for plan in snapshot_plans}
         for index, item_id in enumerate(active_ids, start=1):
-            source = result.item_paths[item_id]
+            plan = plans_by_id[item_id]
+            source = plan.source
             target = mods_root / item_id
             remaining = total - index
-            progress(f"Freezing mod {index}/{total}: {item_id} ({remaining} left)...")
-            shutil.copytree(source, target)
+            action = "Reusing" if plan.reusable else "Storing"
+            progress(f"{action} mod {index}/{total}: {item_id} ({remaining} left)...")
+            snapshot_path = ensure_mod_snapshot(plan)
+            hardlink_snapshot_tree(snapshot_path, target)
             item = result.required.get(item_id)
             entries.append(
                 {
@@ -1110,6 +1463,8 @@ def create_frozen_profile(
                     "package_id": result.installed_package_ids.get(item_id, ""),
                     "title": item.title if item else "",
                     "source": str(source),
+                    "snapshot": str(snapshot_path.relative_to(FROZEN_PROFILES_PATH)),
+                    "snapshot_version": plan.version_key,
                 }
             )
             if progress_count is not None:
@@ -1117,8 +1472,12 @@ def create_frozen_profile(
         user_data_source = result.mods_config_path.parent.parent
         user_data_target = profile_root / "UserData"
         if user_data_source.exists():
-            progress("Freezing saves, settings, and RimWorld/mod user data...")
-            shutil.copytree(user_data_source, user_data_target)
+            progress("Freezing selected saves, settings, and persistent RimWorld/mod data...")
+            shutil.copytree(
+                user_data_source,
+                user_data_target,
+                ignore=compact_user_data_ignore(user_data_source, selected_save_names),
+            )
         else:
             user_data_target.mkdir(parents=True, exist_ok=True)
         version_path = game_root / "Version.txt"
@@ -1127,12 +1486,15 @@ def create_frozen_profile(
         except OSError:
             game_version = ""
         manifest = {
-            "format_version": 2,
+            "format_version": 4,
             "name": profile_name,
             "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
             "game_version": game_version,
             "game_executable": "RimWorldWin64.exe",
             "user_data": "UserData",
+            "selected_saves": selected_save_names,
+            "compact_user_data": True,
+            "shared_mod_snapshots": True,
             "item_ids": active_ids,
             "mods": entries,
         }
@@ -1141,7 +1503,11 @@ def create_frozen_profile(
         return final_profile_root
     except Exception:
         if profile_root.exists():
-            shutil.rmtree(profile_root, ignore_errors=True)
+            try:
+                remove_tree(profile_root)
+            except OSError:
+                pass
+        cleanup_unreferenced_mod_snapshots()
         raise
 
 
@@ -1818,6 +2184,263 @@ def write_mods_config(
     return result.mods_config_path
 
 
+class SaveSelectionDialog(simpledialog.Dialog):
+    def __init__(self, parent: tk.Widget, saves: list[Path]) -> None:
+        self.saves = saves
+        self.listbox: tk.Listbox | None = None
+        self.result: list[str] | None = None
+        super().__init__(parent, title="Select Frozen Profile Saves")
+
+    def body(self, master: tk.Widget) -> tk.Widget | None:
+        self.configure(bg="#101418")
+        self.resizable(True, True)
+        master.configure(bg="#101418")
+        outer = tk.Frame(master, bg="#101418", padx=18, pady=14)
+        outer.pack(fill="both", expand=True)
+        tk.Label(
+            outer,
+            text="Choose the colonies this frozen profile should preserve.",
+            bg="#101418",
+            fg="#f2b35d",
+            font=("Segoe UI", 13, "bold"),
+        ).pack(anchor="w", pady=(0, 6))
+        tk.Label(
+            outer,
+            text="The matching .old backup is included automatically when available.",
+            bg="#101418",
+            fg="#9fb1ad",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(0, 12))
+
+        list_frame = tk.Frame(outer, bg="#101418")
+        list_frame.pack(fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical")
+        scrollbar.pack(side="right", fill="y")
+        self.listbox = tk.Listbox(
+            list_frame,
+            selectmode="extended",
+            width=88,
+            height=min(max(len(self.saves), 6), 16),
+            exportselection=False,
+            yscrollcommand=scrollbar.set,
+            bg="#12181d",
+            fg="#d7dedb",
+            selectbackground="#2d4b55",
+            selectforeground="#ffffff",
+            relief="solid",
+            borderwidth=1,
+            highlightthickness=1,
+            highlightbackground="#2b353c",
+            highlightcolor="#f2b35d",
+            font=("Segoe UI", 10),
+        )
+        self.listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=self.listbox.yview)
+        for save in self.saves:
+            modified = _dt.datetime.fromtimestamp(save.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            backup = " + backup" if save.with_name(f"{save.name}.old").is_file() else ""
+            self.listbox.insert(
+                "end",
+                f"{save.name}  |  {format_file_size(save.stat().st_size)}  |  {modified}{backup}",
+            )
+        if self.saves:
+            self.listbox.selection_set(0)
+
+        controls = tk.Frame(outer, bg="#101418")
+        controls.pack(fill="x", pady=(8, 0))
+        ttk.Button(controls, text="Select All", command=self.select_all).pack(side="left")
+        ttk.Button(controls, text="Clear", command=self.clear_selection).pack(side="left", padx=(8, 0))
+        return self.listbox
+
+    def buttonbox(self) -> None:
+        box = tk.Frame(self, bg="#101418", padx=18)
+        tk.Button(
+            box,
+            text="Use Selected Saves",
+            command=self.ok,
+            bg="#c27a2c",
+            fg="#111111",
+            activebackground="#f2b35d",
+            activeforeground="#111111",
+            font=("Segoe UI", 10, "bold"),
+            relief="flat",
+            padx=16,
+            pady=8,
+            cursor="hand2",
+        ).pack(side="right")
+        tk.Button(
+            box,
+            text="Cancel",
+            command=self.cancel,
+            bg="#273138",
+            fg="#e5ebe8",
+            activebackground="#35434b",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 10),
+            relief="flat",
+            padx=16,
+            pady=8,
+            cursor="hand2",
+        ).pack(side="right", padx=(0, 8))
+        self.bind("<Return>", self.ok)
+        self.bind("<Escape>", self.cancel)
+        box.pack(fill="x", pady=(0, 14))
+
+    def select_all(self) -> None:
+        if self.listbox is not None:
+            self.listbox.selection_set(0, "end")
+
+    def clear_selection(self) -> None:
+        if self.listbox is not None:
+            self.listbox.selection_clear(0, "end")
+
+    def validate(self) -> bool:
+        if self.listbox is None or not self.listbox.curselection():
+            messagebox.showinfo(
+                "Select a save",
+                "Select at least one current .rws save for the frozen profile.",
+                parent=self,
+            )
+            return False
+        return True
+
+    def apply(self) -> None:
+        if self.listbox is not None:
+            self.result = [self.saves[index].name for index in self.listbox.curselection()]
+
+
+class HoverTooltip:
+    def __init__(self, widget: tk.Widget, text_provider) -> None:
+        self.widget = widget
+        self.text_provider = text_provider
+        self.window: tk.Toplevel | None = None
+        widget.bind("<Enter>", self.show)
+        widget.bind("<Leave>", self.hide)
+        widget.bind("<ButtonPress>", self.hide)
+
+    def show(self, _event=None) -> None:
+        if self.window is not None:
+            return
+        text = self.text_provider() if callable(self.text_provider) else str(self.text_provider)
+        if not text:
+            return
+        x = self.widget.winfo_rootx() + self.widget.winfo_width() + 8
+        y = self.widget.winfo_rooty()
+        self.window = tk.Toplevel(self.widget)
+        self.window.wm_overrideredirect(True)
+        self.window.wm_geometry(f"+{x}+{y}")
+        tk.Label(
+            self.window,
+            text=text,
+            justify="left",
+            wraplength=440,
+            bg="#202a30",
+            fg="#eef3ef",
+            relief="solid",
+            borderwidth=1,
+            padx=10,
+            pady=8,
+            font=("Segoe UI", 9),
+        ).pack()
+
+    def hide(self, _event=None) -> None:
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
+
+
+class ProgressButton(tk.Canvas):
+    def __init__(self, parent: tk.Widget, command) -> None:
+        super().__init__(
+            parent,
+            height=68,
+            bg="#c27a2c",
+            highlightthickness=0,
+            borderwidth=0,
+            cursor="hand2",
+        )
+        self.command = command
+        self.button_text = "PLAY NOW"
+        self.button_state = "normal"
+        self.progress_mode = "idle"
+        self.progress_fraction = 0.0
+        self.animation_position = -0.25
+        self.animation_id: str | None = None
+        self.bind("<Button-1>", self._clicked)
+        self.bind("<Configure>", lambda _event: self._draw())
+
+    def configure(self, cnf=None, **kwargs):
+        if cnf:
+            kwargs.update(cnf)
+        text = kwargs.pop("text", None)
+        state = kwargs.pop("state", None)
+        if text is not None:
+            self.button_text = str(text)
+        if state is not None:
+            self.button_state = str(state)
+            super().configure(cursor="hand2" if self.button_state == "normal" else "arrow")
+        if kwargs:
+            super().configure(**kwargs)
+        self._draw()
+
+    config = configure
+
+    def _clicked(self, _event=None) -> None:
+        if self.button_state == "normal":
+            self.command()
+
+    def start_indeterminate(self) -> None:
+        self.stop_animation()
+        self.progress_mode = "indeterminate"
+        self.animation_position = -0.25
+        self._animate()
+
+    def set_progress(self, completed: int, total: int) -> None:
+        self.stop_animation()
+        self.progress_mode = "determinate"
+        self.progress_fraction = min(max(completed / max(total, 1), 0.0), 1.0)
+        self._draw()
+
+    def reset(self) -> None:
+        self.stop_animation()
+        self.progress_mode = "idle"
+        self.progress_fraction = 0.0
+        self._draw()
+
+    def stop_animation(self) -> None:
+        if self.animation_id is not None:
+            self.after_cancel(self.animation_id)
+            self.animation_id = None
+
+    def _animate(self) -> None:
+        self.animation_position += 0.025
+        if self.animation_position > 1.0:
+            self.animation_position = -0.25
+        self._draw()
+        self.animation_id = self.after(24, self._animate)
+
+    def _draw(self) -> None:
+        self.delete("all")
+        width = max(self.winfo_width(), 1)
+        height = max(self.winfo_height(), 1)
+        base = "#8b5b29" if self.button_state != "normal" else "#a76728"
+        self.create_rectangle(0, 0, width, height, fill=base, outline="")
+        if self.progress_mode == "determinate":
+            fill_width = int(width * self.progress_fraction)
+            self.create_rectangle(0, 0, fill_width, height, fill="#f2b35d", outline="")
+        elif self.progress_mode == "indeterminate":
+            segment_width = max(int(width * 0.22), 90)
+            start = int((width + segment_width) * self.animation_position) - segment_width
+            self.create_rectangle(start, 0, start + segment_width, height, fill="#d7903d", outline="")
+        self.create_text(
+            width // 2,
+            height // 2,
+            text=self.button_text,
+            fill="#111111" if self.button_state == "normal" else "#3e342b",
+            font=("Segoe UI", 20, "bold"),
+        )
+
+
 class ProgressorApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -1841,6 +2464,10 @@ class ProgressorApp(tk.Tk):
         self.steamcmd_path = tk.StringVar(
             value=str(detected_steamcmd or "")
         )
+        configured_frozen_profiles = configure_frozen_profiles_path(
+            saved_settings.get("frozen_profiles_path")
+        )
+        self.frozen_profiles_path = tk.StringVar(value=str(configured_frozen_profiles))
         self.auto_activate_after_download = BooleanVar(value=True)
         self.auto_update_on_launch = BooleanVar(
             value=saved_settings.get("auto_update_on_launch") is True
@@ -1854,19 +2481,31 @@ class ProgressorApp(tk.Tk):
         self.table_title = tk.StringVar(value="Mod Differences")
         self.state_filter = tk.StringVar(value="All states")
         self.pack_filter = tk.StringVar(value="All packs")
-        self.frozen_profile = tk.StringVar(value="")
+        self.mod_search = tk.StringVar(value="")
+        available_frozen_profiles = frozen_profile_names()
+        saved_frozen_profile = str(saved_settings.get("selected_frozen_profile", ""))
+        initial_frozen_profile = (
+            saved_frozen_profile
+            if saved_frozen_profile in available_frozen_profiles
+            else (available_frozen_profiles[0] if available_frozen_profiles else "")
+        )
+        self.frozen_profile = tk.StringVar(value=initial_frozen_profile)
         self.busy_message = tk.StringVar(value="")
         self.frozen_profile_combo: ttk.Combobox | None = None
+        self.quick_frozen_button: tk.Button | None = None
+        self.remove_incomplete_button: ttk.Button | None = None
         self.row_item_ids: dict[str, str] = {}
         self.quarantined_rows: dict[str, QuarantinedMod] = {}
         self.advanced_visible = False
         self.logo_image: tk.PhotoImage | None = None
-        self.progress_bar: ttk.Progressbar | None = None
+        self.compact_window_geometry: tuple[int, int] | None = None
         self.mod_context_menu: tk.Menu | None = None
+        self.mod_search_after_id: str | None = None
         self.frozen_frame: ttk.Frame | None = None
         self.frozen_visible = False
 
         self._build_ui()
+        self.update_quick_frozen_button()
         self.protocol("WM_DELETE_WINDOW", self.close_app)
 
     def _configure_styles(self) -> None:
@@ -1884,6 +2523,17 @@ class ProgressorApp(tk.Tk):
         style.map("TButton", background=[("active", "#26343d")], foreground=[("active", "#ffffff")])
         style.configure("TCheckbutton", background="#101418", foreground="#d7dedb")
         style.configure("TCombobox", fieldbackground="#161d22", foreground="#eef3ef", arrowcolor="#f2b35d")
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", "#161d22")],
+            foreground=[("readonly", "#eef3ef")],
+            selectbackground=[("readonly", "#2d4b55")],
+            selectforeground=[("readonly", "#ffffff")],
+        )
+        self.option_add("*TCombobox*Listbox.background", "#12181d")
+        self.option_add("*TCombobox*Listbox.foreground", "#d7dedb")
+        self.option_add("*TCombobox*Listbox.selectBackground", "#2d4b55")
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
         style.configure("TEntry", fieldbackground="#161d22", foreground="#eef3ef", insertcolor="#eef3ef")
         style.configure("Treeview", background="#12181d", foreground="#d7dedb", fieldbackground="#12181d", bordercolor="#2b353c", rowheight=24)
         style.configure("Treeview.Heading", background="#1d272e", foreground="#f2b35d")
@@ -1914,24 +2564,39 @@ class ProgressorApp(tk.Tk):
         quick = ttk.Frame(self, padding=(18, 4, 18, 12))
         quick.grid(row=1, column=0, sticky="ew")
         quick.columnconfigure(0, weight=1)
-        self.play_button = tk.Button(
-            quick,
-            text="PLAY NOW",
-            command=self.play_now,
-            bg="#c27a2c",
-            fg="#111111",
-            activebackground="#f2b35d",
-            activeforeground="#111111",
-            font=("Segoe UI", 20, "bold"),
+        self.play_button = ProgressButton(quick, self.play_now)
+        self.play_button.grid(row=0, column=0, sticky="ew")
+        frozen_quick = ttk.Frame(quick)
+        frozen_quick.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        frozen_quick.columnconfigure(0, weight=1)
+        self.quick_frozen_button = tk.Button(
+            frozen_quick,
+            command=self.play_frozen,
+            bg="#273138",
+            fg="#e5ebe8",
+            activebackground="#35434b",
+            activeforeground="#ffffff",
+            disabledforeground="#768087",
+            font=("Segoe UI", 11, "bold"),
             relief="flat",
-            padx=28,
-            pady=14,
+            padx=18,
+            pady=9,
             cursor="hand2",
         )
-        self.play_button.grid(row=0, column=0, sticky="ew")
-        self.progress_bar = ttk.Progressbar(quick, mode="indeterminate")
-        self.progress_bar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        self.progress_bar.grid_remove()
+        self.quick_frozen_button.grid(row=0, column=0, sticky="ew")
+        frozen_help = tk.Label(
+            frozen_quick,
+            text="?",
+            bg="#1b252b",
+            fg="#f2b35d",
+            font=("Segoe UI", 11, "bold"),
+            width=3,
+            padx=2,
+            pady=8,
+            cursor="question_arrow",
+        )
+        frozen_help.grid(row=0, column=1, padx=(8, 0))
+        HoverTooltip(frozen_help, self.play_mode_tooltip_text)
         ttk.Label(
             quick,
             textvariable=self.busy_message,
@@ -1971,10 +2636,17 @@ class ProgressorApp(tk.Tk):
         steamcmd_entry.grid(row=3, column=1, sticky="ew", pady=4)
         steamcmd_entry.bind("<FocusOut>", lambda _event: self.save_configured_paths())
         ttk.Button(paths, text="Browse", command=self.choose_steamcmd).grid(row=3, column=2, padx=(8, 0), pady=4)
-        ttk.Button(paths, text="Install SteamCMD", command=self.install_steamcmd_for_user).grid(
-            row=4, column=1, sticky="e", pady=(8, 0)
+        ttk.Label(paths, text="Frozen Profiles").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
+        frozen_profiles_entry = ttk.Entry(paths, textvariable=self.frozen_profiles_path)
+        frozen_profiles_entry.grid(row=4, column=1, sticky="ew", pady=4)
+        frozen_profiles_entry.bind("<FocusOut>", lambda _event: self.frozen_profiles_path_changed())
+        ttk.Button(paths, text="Browse", command=self.choose_frozen_profiles_path).grid(
+            row=4, column=2, padx=(8, 0), pady=4
         )
-        ttk.Button(paths, text="Auto Detect Paths", command=self.auto_detect_paths).grid(row=4, column=2, sticky="e", padx=(8, 0), pady=(8, 0))
+        ttk.Button(paths, text="Install SteamCMD", command=self.install_steamcmd_for_user).grid(
+            row=5, column=1, sticky="e", pady=(8, 0)
+        )
+        ttk.Button(paths, text="Auto Detect Paths", command=self.auto_detect_paths).grid(row=5, column=2, sticky="e", padx=(8, 0), pady=(8, 0))
         toolbar = ttk.Frame(self.advanced_frame)
         toolbar.grid(row=1, column=0, sticky="ew")
         ttk.Button(toolbar, text="Scan Ferny's Pack", command=self.start_scan).pack(side="left")
@@ -1983,7 +2655,7 @@ class ProgressorApp(tk.Tk):
         ttk.Button(toolbar, text="Always Enable Selected", command=self.always_enable_selected).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Reset Selected", command=self.reset_selected).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Always Disable Selected", command=self.disable_selected).pack(side="left", padx=6)
-        ttk.Button(toolbar, text="Activate + Vanilla Sort", command=self.write_config).pack(side="left", padx=6)
+        ttk.Button(toolbar, text="Apply Mod List + Sort", command=self.write_config).pack(side="left", padx=6)
         self.frozen_button = ttk.Button(toolbar, text="Frozen Profiles", command=self.toggle_frozen_options)
         self.frozen_button.pack(side="left", padx=6)
         ttk.Button(toolbar, text="Launch RimWorld", command=self.advanced_launch).pack(side="right")
@@ -2019,11 +2691,20 @@ class ProgressorApp(tk.Tk):
             width=34,
         )
         self.frozen_profile_combo.pack(side="left", padx=(8, 0))
+        self.frozen_profile_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self.frozen_profile_selection_changed(),
+        )
         ttk.Button(self.frozen_frame, text="Refresh Profiles", command=self.refresh_frozen_profiles).pack(side="left", padx=(8, 0))
         ttk.Button(self.frozen_frame, text="Freeze Current Setup", command=self.freeze_current_setup).pack(side="left", padx=(8, 0))
         ttk.Button(self.frozen_frame, text="Play Frozen", command=self.play_frozen).pack(side="left", padx=(8, 0))
         ttk.Button(self.frozen_frame, text="Open Selected Folder", command=self.open_frozen_profile_folder).pack(side="left", padx=(8, 0))
         ttk.Button(self.frozen_frame, text="Remove Selected", command=self.remove_frozen_profile).pack(side="left", padx=(8, 0))
+        self.remove_incomplete_button = ttk.Button(
+            self.frozen_frame,
+            text="Remove Incomplete Copies",
+            command=self.remove_incomplete_frozen_profiles,
+        )
         self.frozen_frame.grid_remove()
 
         main = ttk.PanedWindow(self, orient="horizontal")
@@ -2096,6 +2777,11 @@ class ProgressorApp(tk.Tk):
         )
         self.pack_combo.pack(side="left", padx=(6, 0))
         self.pack_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_mod_filters())
+        ttk.Label(filters, text="Search").pack(side="left", padx=(14, 0))
+        search_entry = ttk.Entry(filters, textvariable=self.mod_search, width=28)
+        search_entry.pack(side="left", padx=(6, 0))
+        search_entry.bind("<KeyRelease>", lambda _event: self.schedule_mod_search())
+        ttk.Button(filters, text="Clear", command=self.clear_mod_search).pack(side="left", padx=(6, 0))
 
         self.tree = ttk.Treeview(right, columns=("state", "collection", "title"), show="headings")
         self.tree.heading("state", text="State")
@@ -2157,17 +2843,50 @@ class ProgressorApp(tk.Tk):
             rows = self.current_rows
         state_filter = self.state_filter.get()
         pack_filter = self.pack_filter.get()
+        search_query = self.mod_search.get().strip()
+        matched_rows: list[tuple[float, str]] = []
         for state, collection, title, item_id, quarantined_mod in rows:
             if not load_order_view and state_filter != "All states" and state != state_filter:
                 continue
             if not load_order_view and pack_filter != "All packs":
                 if collection != pack_filter:
                     continue
+            searchable_text = " ".join(
+                value
+                for value in (state, collection, title, item_id or "")
+                if value
+            )
+            search_score = mod_search_score(search_query, searchable_text)
+            if search_query and search_score < 0.5:
+                continue
             row_id = self.tree.insert("", "end", values=(state, collection, title))
+            if search_query:
+                matched_rows.append((search_score, row_id))
             if item_id:
                 self.row_item_ids[row_id] = item_id
             if quarantined_mod:
                 self.quarantined_rows[row_id] = quarantined_mod
+        if matched_rows:
+            _, best_row = max(matched_rows, key=lambda match: match[0])
+            self.tree.selection_set(best_row)
+            self.tree.focus(best_row)
+            self.tree.see(best_row)
+
+    def clear_mod_search(self) -> None:
+        if self.mod_search_after_id is not None:
+            self.after_cancel(self.mod_search_after_id)
+            self.mod_search_after_id = None
+        self.mod_search.set("")
+        self.apply_mod_filters()
+
+    def schedule_mod_search(self) -> None:
+        if self.mod_search_after_id is not None:
+            self.after_cancel(self.mod_search_after_id)
+        self.mod_search_after_id = self.after(180, self.apply_scheduled_mod_search)
+
+    def apply_scheduled_mod_search(self) -> None:
+        self.mod_search_after_id = None
+        self.apply_mod_filters()
 
     def selected_item_ids(self) -> set[str]:
         return {
@@ -2221,12 +2940,74 @@ class ProgressorApp(tk.Tk):
 
     def refresh_frozen_profiles(self) -> None:
         names = frozen_profile_names()
+        previous_profile = self.frozen_profile.get()
         if self.frozen_profile_combo is not None:
             self.frozen_profile_combo.configure(values=names)
         if names and self.frozen_profile.get() not in names:
             self.frozen_profile.set(names[0])
         elif not names:
             self.frozen_profile.set("")
+        self.update_quick_frozen_button()
+        self.update_incomplete_frozen_button()
+        if self.frozen_profile.get() != previous_profile:
+            self.save_configured_paths()
+
+    @staticmethod
+    def shortened_profile_name(profile_name: str, max_length: int = 42) -> str:
+        if len(profile_name) <= max_length:
+            return profile_name
+        return f"{profile_name[:max_length - 3].rstrip()}..."
+
+    def update_quick_frozen_button(self) -> None:
+        if self.quick_frozen_button is None:
+            return
+        profile_name = self.frozen_profile.get().strip()
+        if profile_name and profile_name in frozen_profile_names():
+            self.quick_frozen_button.configure(
+                text=f"PLAY FROZEN: {self.shortened_profile_name(profile_name)}",
+                state="normal",
+                cursor="hand2",
+            )
+        else:
+            self.quick_frozen_button.configure(
+                text="PLAY FROZEN: NO PROFILE",
+                state="disabled",
+                cursor="arrow",
+            )
+
+    def frozen_profile_selection_changed(self) -> None:
+        self.update_quick_frozen_button()
+        self.save_configured_paths()
+
+    def update_incomplete_frozen_button(self) -> None:
+        if self.remove_incomplete_button is None:
+            return
+        count = len(incomplete_frozen_profile_paths())
+        if count:
+            self.remove_incomplete_button.configure(text=f"Remove Incomplete Copies ({count})")
+            if not self.remove_incomplete_button.winfo_manager():
+                self.remove_incomplete_button.pack(side="left", padx=(8, 0))
+        elif self.remove_incomplete_button.winfo_manager():
+            self.remove_incomplete_button.pack_forget()
+
+    def select_frozen_profile(self, profile_name: str) -> None:
+        self.frozen_profile.set(profile_name)
+        self.frozen_profile_selection_changed()
+
+    def play_mode_tooltip_text(self) -> str:
+        profile_name = self.frozen_profile.get().strip()
+        frozen_detail = (
+            f"PLAY FROZEN launches '{profile_name}'"
+            if profile_name
+            else "PLAY FROZEN requires a frozen profile"
+        )
+        return (
+            "PLAY NOW prepares the current live Ferny pack. It can download missing mods, apply your "
+            "enabled/disabled choices, sort the active list, and update mods when Auto-update is enabled.\n\n"
+            f"{frozen_detail} using its copied RimWorld version, mods, saves, settings, and mod data. "
+            "It does not update that profile to Ferny's current pack. Changes made while playing remain "
+            "inside the frozen profile."
+        )
 
     def toggle_frozen_options(self) -> None:
         self.frozen_visible = not self.frozen_visible
@@ -2243,11 +3024,24 @@ class ProgressorApp(tk.Tk):
     def toggle_advanced(self) -> None:
         self.advanced_visible = not self.advanced_visible
         if self.advanced_visible:
+            self.update_idletasks()
+            self.compact_window_geometry = (self.winfo_width(), self.winfo_height())
             self.advanced_frame.grid(row=2, column=0, sticky="ew")
             self.advanced_button.configure(text="Hide Advanced Options")
+            self.update_idletasks()
+            width, height = self.compact_window_geometry
+            expanded_height = min(
+                max(height + 260, self.winfo_reqheight()),
+                self.winfo_screenheight() - 70,
+            )
+            self.geometry(f"{width}x{expanded_height}")
         else:
             self.advanced_frame.grid_remove()
             self.advanced_button.configure(text="Show Advanced Options")
+            if self.compact_window_geometry is not None:
+                width, height = self.compact_window_geometry
+                self.geometry(f"{width}x{height}")
+                self.compact_window_geometry = None
 
     def progress(self, message: str) -> None:
         def append() -> None:
@@ -2278,6 +3072,23 @@ class ProgressorApp(tk.Tk):
         if path:
             self.local_mods_path.set(path)
             self.save_configured_paths()
+
+    def choose_frozen_profiles_path(self) -> None:
+        current = normalize_frozen_profiles_path(self.frozen_profiles_path.get())
+        initial_dir = current if current.exists() else current.parent
+        path = filedialog.askdirectory(initialdir=str(initial_dir))
+        if path:
+            self.frozen_profiles_path.set(str(Path(path).resolve()))
+            self.frozen_profiles_path_changed()
+
+    def frozen_profiles_path_changed(self) -> None:
+        configured = configure_frozen_profiles_path(self.frozen_profiles_path.get())
+        self.frozen_profiles_path.set(str(configured))
+        self.save_configured_paths()
+        self.refresh_frozen_profiles()
+        self.progress(
+            f"Frozen profile storage set to {configured}. Existing profiles are not moved automatically."
+        )
 
     def choose_steamcmd(self) -> None:
         initial = self.steamcmd_path.get()
@@ -2318,6 +3129,11 @@ class ProgressorApp(tk.Tk):
             steamcmd_text = str(resolved_steamcmd)
             if self.steamcmd_path.get() != steamcmd_text:
                 self.steamcmd_path.set(steamcmd_text)
+        frozen_profiles_text = str(
+            configure_frozen_profiles_path(self.frozen_profiles_path.get())
+        )
+        if self.frozen_profiles_path.get() != frozen_profiles_text:
+            self.frozen_profiles_path.set(frozen_profiles_text)
         try:
             save_settings(
                 {
@@ -2325,6 +3141,8 @@ class ProgressorApp(tk.Tk):
                     "local_mods_path": self.local_mods_path.get().strip(),
                     "mods_config_path": self.mods_config_path.get().strip(),
                     "steamcmd_path": steamcmd_text,
+                    "frozen_profiles_path": frozen_profiles_text,
+                    "selected_frozen_profile": self.frozen_profile.get().strip(),
                     "exclude_cosmetics": self.exclude_cosmetics.get(),
                     "auto_update_on_launch": self.auto_update_on_launch.get(),
                 }
@@ -2396,20 +3214,15 @@ class ProgressorApp(tk.Tk):
 
     def set_busy(self, message: str) -> None:
         self.play_button.configure(state="disabled", text=message.upper())
+        self.play_button.start_indeterminate()
+        if self.quick_frozen_button is not None:
+            self.quick_frozen_button.configure(state="disabled")
         self.busy_message.set(message)
-        if self.progress_bar is not None:
-            self.progress_bar.stop()
-            self.progress_bar.configure(mode="indeterminate", value=0)
-            self.progress_bar.grid()
-            self.progress_bar.start(12)
 
     def update_busy_download_progress(self, completed: int, total: int) -> None:
         def apply() -> None:
             remaining = max(total - completed, 0)
-            if self.progress_bar is not None:
-                self.progress_bar.stop()
-                self.progress_bar.configure(mode="determinate", maximum=max(total, 1), value=completed)
-                self.progress_bar.grid()
+            self.play_button.set_progress(completed, total)
             self.busy_message.set(f"{completed} of {total} mods complete - {remaining} remaining")
             self.play_button.configure(text=f"{completed}/{total} MODS")
 
@@ -2418,22 +3231,17 @@ class ProgressorApp(tk.Tk):
     def update_busy_check_progress(self, checked: int, total: int) -> None:
         def apply() -> None:
             remaining = max(total - checked, 0)
-            if self.progress_bar is not None:
-                self.progress_bar.stop()
-                self.progress_bar.configure(mode="determinate", maximum=max(total, 1), value=checked)
-                self.progress_bar.grid()
+            self.play_button.set_progress(checked, total)
             self.busy_message.set(f"{checked} of {total} mods checked - {remaining} left")
             self.play_button.configure(text=f"{checked}/{total} CHECKED")
 
         self.after(0, apply)
 
     def clear_busy(self) -> None:
-        if self.progress_bar is not None:
-            self.progress_bar.stop()
-            self.progress_bar.configure(mode="indeterminate", value=0)
-            self.progress_bar.grid_remove()
+        self.play_button.reset()
         self.busy_message.set("")
         self.play_button.configure(state="normal", text="PLAY NOW")
+        self.update_quick_frozen_button()
 
     def run_busy_worker(self, message: str, target) -> None:
         self.set_busy(message)
@@ -2878,31 +3686,96 @@ class ProgressorApp(tk.Tk):
         if not profile_name:
             messagebox.showinfo("Name required", "Enter a profile name.")
             return
-        if not messagebox.askyesno(
-            "Create full frozen profile?",
-            "This creates an independent copy of the active mods, RimWorld game version, saves, "
-            "settings, and mod data. Large modpacks can require many gigabytes of free disk space.\n\n"
-            "Continue?",
-        ):
+        user_data_root = result.mods_config_path.parent.parent
+        saves = available_rimworld_saves(user_data_root)
+        if not saves:
+            messagebox.showinfo(
+                "No current saves found",
+                f"No .rws saves were found in:\n\n{user_data_root / 'Saves'}",
+            )
+            return
+        save_dialog = SaveSelectionDialog(self, saves)
+        selected_save_names = save_dialog.result
+        if not selected_save_names:
             return
 
         def worker() -> None:
             try:
+                active_ids = frozen_active_item_ids(result)
+                self.progress(
+                    f"Estimating compact frozen profile size for {len(active_ids)} mods and "
+                    f"{len(selected_save_names)} save(s)..."
+                )
+                (
+                    game_size,
+                    mods_size,
+                    new_mod_storage,
+                    user_data_size,
+                    snapshot_plans,
+                ) = estimate_frozen_profile_size(
+                    result,
+                    active_ids,
+                    selected_save_names,
+                )
+                reused_mod_storage = mods_size - new_mod_storage
+                estimated_size = game_size + new_mod_storage + user_data_size
+                FROZEN_PROFILES_PATH.mkdir(parents=True, exist_ok=True)
+                free_space = shutil.disk_usage(FROZEN_PROFILES_PATH).free
+                space_warning = (
+                    "\n\nWARNING: The selected destination does not currently have enough free space."
+                    if estimated_size > free_space
+                    else ""
+                )
+                accepted = threading.Event()
+                prompt_done = threading.Event()
+
+                def confirm() -> None:
+                    if messagebox.askyesno(
+                        "Create compact frozen profile?",
+                        f"Profile: {profile_name}\n"
+                        f"Selected saves: {len(selected_save_names)}\n\n"
+                        f"RimWorld game snapshot: {format_file_size(game_size)}\n"
+                        f"Exact active mods (logical size): {format_file_size(mods_size)}\n"
+                        f"New shared mod storage required: {format_file_size(new_mod_storage)}\n"
+                        f"Existing shared mod storage reused: {format_file_size(reused_mod_storage)}\n"
+                        f"Selected saves, settings, and persistent mod data: "
+                        f"{format_file_size(user_data_size)}\n\n"
+                        f"Estimated additional disk required: {format_file_size(estimated_size)}\n"
+                        f"Free space at destination: {format_file_size(free_space)}"
+                        f"{space_warning}\n\n"
+                        "Known disposable caches, logs, unrelated saves, and unrelated save backups "
+                        "will not be copied. Continue?",
+                    ):
+                        accepted.set()
+                    prompt_done.set()
+
+                self.after(0, confirm)
+                prompt_done.wait()
+                if not accepted.is_set():
+                    self.progress("Frozen profile creation cancelled.")
+                    return
+                if estimated_size > free_space:
+                    raise RuntimeError(
+                        f"Not enough free space. Estimated {format_file_size(estimated_size)}, "
+                        f"available {format_file_size(free_space)}."
+                    )
                 path = create_frozen_profile(
                     result,
                     profile_name,
+                    selected_save_names,
+                    snapshot_plans,
                     self.progress,
                     progress_count=self.update_busy_download_progress,
                 )
                 self.progress(f"Frozen profile created: {path}")
                 self.after(0, self.refresh_frozen_profiles)
-                self.after(0, lambda: self.frozen_profile.set(profile_name))
+                self.after(0, lambda: self.select_frozen_profile(profile_name))
             except (RuntimeError, OSError) as exc:
                 self.progress(f"Freeze failed: {exc}")
                 error = str(exc)
                 self.after(0, lambda: messagebox.showerror("Freeze failed", error))
 
-        self.run_busy_worker("Freezing setup...", worker)
+        self.run_busy_worker("Estimating frozen profile...", worker)
 
     def play_frozen(self) -> None:
         if rimworld_is_running():
@@ -2963,8 +3836,9 @@ class ProgressorApp(tk.Tk):
         def worker() -> None:
             try:
                 self.progress(f"Removing frozen profile: {profile_name}")
-                shutil.rmtree(profile_path)
+                remove_tree(profile_path)
                 self.progress(f"Removed frozen profile: {profile_name}")
+                cleanup_unreferenced_mod_snapshots(self.progress)
                 self.after(0, self.refresh_frozen_profiles)
             except OSError as exc:
                 error = str(exc)
@@ -2972,6 +3846,71 @@ class ProgressorApp(tk.Tk):
                 self.after(0, lambda: messagebox.showerror("Remove failed", error))
 
         self.run_busy_worker("Removing frozen profile...", worker)
+
+    def remove_incomplete_frozen_profiles(self) -> None:
+        incomplete_paths = incomplete_frozen_profile_paths()
+        if not incomplete_paths:
+            self.update_incomplete_frozen_button()
+            messagebox.showinfo("No incomplete copies", "No interrupted frozen-profile copies were found.")
+            return
+
+        def worker() -> None:
+            self.progress(f"Measuring {len(incomplete_paths)} incomplete frozen copy/copies...")
+            sizes = {path: directory_size_bytes(path) for path in incomplete_paths}
+            total_size = sum(sizes.values())
+            preview = "\n".join(f"- {path.name}" for path in incomplete_paths[:5])
+            if len(incomplete_paths) > 5:
+                preview += f"\n- and {len(incomplete_paths) - 5} more"
+
+            accepted = threading.Event()
+            prompt_done = threading.Event()
+
+            def confirm() -> None:
+                if messagebox.askyesno(
+                    "Remove incomplete frozen copies?",
+                    f"Found {len(incomplete_paths)} interrupted temporary profile folder(s) using "
+                    f"{format_file_size(total_size)}:\n\n{preview}\n\n"
+                    "These folders are not playable profiles and are hidden from the profile list. "
+                    "Close any other Progression Launcher window before continuing.\n\n"
+                    "Permanently delete them?",
+                ):
+                    accepted.set()
+                prompt_done.set()
+
+            self.after(0, confirm)
+            prompt_done.wait()
+            if not accepted.is_set():
+                self.progress("Incomplete frozen-copy cleanup cancelled.")
+                return
+
+            removed = 0
+            removed_size = 0
+            failed: list[str] = []
+            for path in incomplete_paths:
+                try:
+                    self.progress(f"Removing incomplete frozen copy: {path.name}")
+                    remove_tree(path)
+                    removed += 1
+                    removed_size += sizes[path]
+                except OSError as exc:
+                    failed.append(f"{path.name}: {exc}")
+            self.progress(
+                f"Removed {removed} incomplete frozen copy/copies and reclaimed "
+                f"{format_file_size(removed_size)}."
+            )
+            cleanup_unreferenced_mod_snapshots(self.progress)
+            self.after(0, self.refresh_frozen_profiles)
+            if failed:
+                details = "\n".join(failed[:5])
+                self.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Some copies could not be removed",
+                        f"{len(failed)} incomplete folder(s) could not be removed:\n\n{details}",
+                    ),
+                )
+
+        self.run_busy_worker("Inspecting incomplete copies...", worker)
 
     def open_frozen_profile_folder(self) -> None:
         self.refresh_frozen_profiles()
