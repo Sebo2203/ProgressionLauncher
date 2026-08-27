@@ -3,9 +3,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-BUILD_ROOT="../ferny_progressor_build_macos"
+BUILD_ROOT=".build/ferny_progressor_build_macos"
 VENV="$BUILD_ROOT/.venv"
-DIST="../dist"
+DIST="dist"
 APP_DIR="$(pwd)"
 
 if [ ! -x "$VENV/bin/python" ]; then

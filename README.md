@@ -199,7 +199,7 @@ To build a macOS app bundle on a Mac:
 The built app appears at:
 
 ```text
-../dist/Progression Launcher.app
+dist/Progression Launcher.app
 ```
 
 To run the local macOS compatibility smoke test from any development machine:

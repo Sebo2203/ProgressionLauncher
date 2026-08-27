@@ -53,11 +53,11 @@ jobs:
           ./build_macos.sh
 
       - name: Ad-hoc sign app bundle
-        run: codesign --force --deep --sign - ../dist/Progression\ Launcher.app
+        run: codesign --force --deep --sign - dist/Progression\ Launcher.app
 
       - name: Package app bundle
         run: |
-          cd ../dist
+          cd dist
           ditto -c -k --sequesterRsrc --keepParent "Progression Launcher.app" "$MAC_ZIP"
           shasum -a 256 "$MAC_ZIP" > "$MAC_ZIP.sha256"
 
@@ -66,8 +66,8 @@ jobs:
         with:
           name: Progression-Launcher-macOS
           path: |
-            ../dist/${{ env.MAC_ZIP }}
-            ../dist/${{ env.MAC_ZIP }}.sha256
+            dist/${{ env.MAC_ZIP }}
+            dist/${{ env.MAC_ZIP }}.sha256
 
       - name: Publish macOS test release asset
         uses: softprops/action-gh-release@v2
@@ -78,5 +78,5 @@ jobs:
           make_latest: false
           body_path: MAC_TESTER.md
           files: |
-            ../dist/${{ env.MAC_ZIP }}
-            ../dist/${{ env.MAC_ZIP }}.sha256
+            dist/${{ env.MAC_ZIP }}
+            dist/${{ env.MAC_ZIP }}.sha256
