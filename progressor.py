@@ -30,7 +30,7 @@ import tkinter as tk
 
 APP_ID = "294100"
 APP_NAME = "Progression Launcher"
-APP_VERSION = "0.4.3-candidate.1"
+APP_VERSION = "0.4.3"
 COLLECTIONS = {
     "Core": "3521297585",
     "Content": "3521319712",

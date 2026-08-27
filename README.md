@@ -2,7 +2,9 @@
 
 Windows and macOS helper for launching Ferny's Progression RimWorld modpack.
 
-[**Download Progression Launcher v0.4.2 for Windows**](https://sebo2203.github.io/ProgressionLauncher/?v=0.4.2)
+[**Download Progression Launcher v0.4.3 for Windows**](https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.3/ProgressionLauncher-v0.4.3.exe)
+
+[**Download Progression Launcher v0.4.3 macOS Candidate**](https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.3-macos-test/ProgressionLauncher-macOS-v0.4.3-candidate.1.zip)
 
 macOS test builds are produced by the `Build macOS` GitHub Actions workflow as an artifact named `Progression-Launcher-macOS`. See [MAC_TESTER.md](MAC_TESTER.md) for tester instructions.
 

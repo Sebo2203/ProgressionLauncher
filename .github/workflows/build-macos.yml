@@ -76,6 +76,7 @@ jobs:
           name: ${{ env.RELEASE_NAME }}
           prerelease: true
           make_latest: false
+          overwrite_files: true
           body_path: MAC_TESTER.md
           files: |
             dist/${{ env.MAC_ZIP }}

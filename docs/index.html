@@ -3,7 +3,6 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="2;url=https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.2/ProgressionLauncher-v0.4.2.exe">
   <title>Download Progression Launcher</title>
   <style>
     * { box-sizing: border-box; }
@@ -49,7 +48,20 @@
       font-weight: 700;
       text-decoration: none;
     }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 14px;
+      margin-top: 8px;
+    }
+    a.secondary {
+      border-color: #58706c;
+      background: #25363a;
+      color: #d7dedb;
+    }
     a:hover { background: #f2b35d; }
+    a.secondary:hover { background: #31484d; }
     small {
       display: block;
       margin-top: 22px;
@@ -61,14 +73,12 @@
   <main>
     <img src="progression_logo.png" alt="RimWorld Progression">
     <h1>Progression Launcher</h1>
-    <p>Your download should begin automatically. Windows may ask you to confirm running an unsigned application.</p>
-    <a id="download" href="https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.2/ProgressionLauncher-v0.4.2.exe">Download Launcher</a>
-    <small>Version 0.4.2 for Windows</small>
+    <p>Choose your platform. Windows is the current stable build; macOS is a candidate build for testers.</p>
+    <div class="actions">
+      <a href="https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.3/ProgressionLauncher-v0.4.3.exe">Download for Windows</a>
+      <a class="secondary" href="https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.3-macos-test/ProgressionLauncher-macOS-v0.4.3-candidate.1.zip">Download macOS Candidate</a>
+    </div>
+    <small>Windows v0.4.3 · macOS v0.4.3 candidate</small>
   </main>
-  <script>
-    window.setTimeout(() => {
-      window.location.href = document.getElementById("download").href;
-    }, 600);
-  </script>
 </body>
 </html>
