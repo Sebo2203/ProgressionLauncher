@@ -6,11 +6,13 @@ import difflib
 import hashlib
 import json
 import os
+import plistlib
 import re
 import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -28,7 +30,7 @@ import tkinter as tk
 
 APP_ID = "294100"
 APP_NAME = "Progression Launcher"
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.4.3-candidate.1"
 COLLECTIONS = {
     "Core": "3521297585",
     "Content": "3521319712",
@@ -40,13 +42,25 @@ COLLECTION_DETAILS_URL = "https://api.steampowered.com/ISteamRemoteStorage/GetCo
 PUBLISHED_FILE_DETAILS_URL = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
 STEAM_RUN_RIMWORLD = "steam://rungameid/294100"
 STEAM_COLLECTION_URL = "steam://url/CommunityFilePage/{id}"
-STEAMCMD_DOWNLOAD_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
+STEAMCMD_DOWNLOAD_URLS = {
+    "win32": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip",
+    "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
+}
+INSTANCE_MUTEX_NAME = r"Local\ProgressionLauncher.SingleInstance"
+_INSTANCE_MUTEX_HANDLE = None
 
 
 def app_data_dir() -> Path:
-    base = os.environ.get("LOCALAPPDATA")
-    root = Path(base) if base else Path.home() / "AppData" / "Local"
-    path = root / "ProgressionLauncher"
+    if sys.platform == "darwin":
+        path = Path.home() / "Library" / "Application Support" / "ProgressionLauncher"
+    elif sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
+        root = Path(base) if base else Path.home() / "AppData" / "Local"
+        path = root / "ProgressionLauncher"
+    else:
+        base = os.environ.get("XDG_DATA_HOME")
+        root = Path(base) if base else Path.home() / ".local" / "share"
+        path = root / "ProgressionLauncher"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -60,6 +74,155 @@ def executable_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def running_launcher_process_names() -> list[str]:
+    if sys.platform != "win32":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    invalid_handle = ctypes.c_void_p(-1).value
+    if snapshot == invalid_handle:
+        return []
+    current_pid = os.getpid()
+    processes: list[tuple[int, int, str]] = []
+    entry = ProcessEntry32W()
+    entry.dwSize = ctypes.sizeof(entry)
+    try:
+        if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            while True:
+                processes.append(
+                    (
+                        int(entry.th32ProcessID),
+                        int(entry.th32ParentProcessID),
+                        str(entry.szExeFile),
+                    )
+                )
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+    current_entry = next((item for item in processes if item[0] == current_pid), None)
+    current_parent_pid = current_entry[1] if current_entry else 0
+    current_name = current_entry[2].lower() if current_entry else ""
+    ignored_pids = {current_pid}
+    if getattr(sys, "frozen", False):
+        parent_entry = next((item for item in processes if item[0] == current_parent_pid), None)
+        if parent_entry and parent_entry[2].lower() == current_name:
+            ignored_pids.add(current_parent_pid)
+
+    matches: list[str] = []
+    for process_id, _parent_id, executable_name in processes:
+        if process_id in ignored_pids:
+            continue
+        stem = Path(executable_name).stem.lower()
+        if stem == "progression launcher" or stem.startswith("progression launcher v"):
+            matches.append(executable_name)
+    return sorted(set(matches), key=str.lower)
+
+
+def acquire_single_instance() -> tuple[bool, list[str]]:
+    global _INSTANCE_MUTEX_HANDLE
+    if sys.platform != "win32":
+        try:
+            import fcntl
+
+            lock_path = app_data_dir() / "progression-launcher.lock"
+            handle = lock_path.open("w", encoding="utf-8")
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            handle.write(str(os.getpid()))
+            handle.truncate()
+            handle.flush()
+            _INSTANCE_MUTEX_HANDLE = handle
+            return True, []
+        except (ImportError, OSError):
+            return False, []
+    existing_processes = running_launcher_process_names()
+    if existing_processes:
+        return False, existing_processes
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateMutexW(None, False, INSTANCE_MUTEX_NAME)
+    if not handle:
+        return False, []
+    if ctypes.get_last_error() == 183:
+        kernel32.CloseHandle(handle)
+        return False, []
+    _INSTANCE_MUTEX_HANDLE = handle
+    return True, []
+
+
+def release_single_instance() -> None:
+    global _INSTANCE_MUTEX_HANDLE
+    if sys.platform != "win32" and _INSTANCE_MUTEX_HANDLE:
+        try:
+            import fcntl
+
+            fcntl.flock(_INSTANCE_MUTEX_HANDLE, fcntl.LOCK_UN)
+            _INSTANCE_MUTEX_HANDLE.close()
+        except (ImportError, OSError):
+            pass
+        _INSTANCE_MUTEX_HANDLE = None
+    elif sys.platform == "win32" and _INSTANCE_MUTEX_HANDLE:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(_INSTANCE_MUTEX_HANDLE)
+        _INSTANCE_MUTEX_HANDLE = None
+
+
+def show_single_instance_warning(existing_processes: list[str]) -> None:
+    details = ""
+    if existing_processes:
+        details = f"\n\nDetected: {', '.join(existing_processes)}"
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        messagebox.showwarning(
+            "Progression Launcher is already running",
+            "Another Progression Launcher window or version is already running. "
+            "Close it before opening this launcher so both copies cannot modify "
+            f"RimWorld, SteamCMD, or frozen profiles at the same time.{details}",
+            parent=root,
+        )
+    finally:
+        root.destroy()
 
 
 CACHE_PATH = app_data_dir() / "collection_cache.json"
@@ -146,10 +309,23 @@ class ModSnapshotPlan:
 
 
 def steam_root_candidates() -> list[Path]:
-    candidates = [
-        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Steam",
-        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Steam",
-    ]
+    if sys.platform == "darwin":
+        candidates = [
+            Path.home() / "Library" / "Application Support" / "Steam",
+            Path("/Applications/Steam.app/Contents/MacOS"),
+        ]
+    elif sys.platform == "win32":
+        candidates = [
+            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Steam",
+            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Steam",
+        ]
+    else:
+        home = Path.home()
+        candidates = [
+            home / ".steam" / "steam",
+            home / ".local" / "share" / "Steam",
+            home / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam",
+        ]
     seen: set[Path] = set()
     unique: list[Path] = []
     for candidate in candidates:
@@ -191,10 +367,27 @@ def steam_library_paths() -> list[Path]:
 def default_workshop_path() -> Path:
     candidates = [library / "steamapps" / "workshop" / "content" / APP_ID for library in steam_library_paths()]
     if not candidates:
-        candidates = [
-            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Steam" / "steamapps" / "workshop" / "content" / APP_ID,
-            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Steam" / "steamapps" / "workshop" / "content" / APP_ID,
-        ]
+        if sys.platform == "darwin":
+            candidates = [
+                Path.home()
+                / "Library"
+                / "Application Support"
+                / "Steam"
+                / "steamapps"
+                / "workshop"
+                / "content"
+                / APP_ID,
+            ]
+        elif sys.platform == "win32":
+            candidates = [
+                Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Steam" / "steamapps" / "workshop" / "content" / APP_ID,
+                Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Steam" / "steamapps" / "workshop" / "content" / APP_ID,
+            ]
+        else:
+            candidates = [
+                Path.home() / ".steam" / "steam" / "steamapps" / "workshop" / "content" / APP_ID,
+                Path.home() / ".local" / "share" / "Steam" / "steamapps" / "workshop" / "content" / APP_ID,
+            ]
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -202,24 +395,85 @@ def default_workshop_path() -> Path:
 
 
 def default_mods_config_path() -> Path:
-    return (
-        Path.home()
-        / "AppData"
-        / "LocalLow"
-        / "Ludeon Studios"
-        / "RimWorld by Ludeon Studios"
-        / "Config"
-        / "ModsConfig.xml"
-    )
+    if sys.platform == "darwin":
+        candidates = [
+            Path.home() / "Library" / "Application Support" / "RimWorld" / "Config" / "ModsConfig.xml",
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "Ludeon Studios"
+            / "RimWorld by Ludeon Studios"
+            / "Config"
+            / "ModsConfig.xml",
+        ]
+    elif sys.platform == "win32":
+        candidates = [
+            Path.home()
+            / "AppData"
+            / "LocalLow"
+            / "Ludeon Studios"
+            / "RimWorld by Ludeon Studios"
+            / "Config"
+            / "ModsConfig.xml",
+        ]
+    else:
+        candidates = [
+            Path.home() / ".config" / "unity3d" / "Ludeon Studios" / "RimWorld by Ludeon Studios" / "Config" / "ModsConfig.xml",
+        ]
+    for candidate in candidates:
+        if candidate.exists() or candidate.parent.exists():
+            return candidate
+    return candidates[0]
 
 
 def default_rimworld_mods_path() -> Path:
-    candidates = [library / "steamapps" / "common" / "RimWorld" / "Mods" for library in steam_library_paths()]
+    candidates: list[Path] = []
+    for library in steam_library_paths():
+        rimworld_root = library / "steamapps" / "common" / "RimWorld"
+        if sys.platform == "darwin":
+            candidates.extend(
+                [
+                    rimworld_root / "RimWorldMac.app" / "Mods",
+                    rimworld_root / "RimWorldMac.app" / "Contents" / "Resources" / "Mods",
+                    rimworld_root / "Mods",
+                ]
+            )
+        else:
+            candidates.append(rimworld_root / "Mods")
     if not candidates:
-        candidates = [
-            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Steam" / "steamapps" / "common" / "RimWorld" / "Mods",
-            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Steam" / "steamapps" / "common" / "RimWorld" / "Mods",
-        ]
+        if sys.platform == "darwin":
+            candidates = [
+                Path.home()
+                / "Library"
+                / "Application Support"
+                / "Steam"
+                / "steamapps"
+                / "common"
+                / "RimWorld"
+                / "RimWorldMac.app"
+                / "Mods",
+                Path.home()
+                / "Library"
+                / "Application Support"
+                / "Steam"
+                / "steamapps"
+                / "common"
+                / "RimWorld"
+                / "RimWorldMac.app"
+                / "Contents"
+                / "Resources"
+                / "Mods",
+            ]
+        elif sys.platform == "win32":
+            candidates = [
+                Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Steam" / "steamapps" / "common" / "RimWorld" / "Mods",
+                Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Steam" / "steamapps" / "common" / "RimWorld" / "Mods",
+            ]
+        else:
+            candidates = [
+                Path.home() / ".steam" / "steam" / "steamapps" / "common" / "RimWorld" / "Mods",
+                Path.home() / ".local" / "share" / "Steam" / "steamapps" / "common" / "RimWorld" / "Mods",
+            ]
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -234,12 +488,13 @@ def resolved_executable_path(raw_path: str | Path | None) -> Path | None:
         return None
     candidate = Path(text)
     if candidate.is_dir():
-        candidate /= "steamcmd.exe"
+        candidate /= "steamcmd.sh" if sys.platform == "darwin" else "steamcmd.exe"
     try:
         candidate = candidate.resolve(strict=True)
     except (OSError, RuntimeError):
         return None
-    if candidate.is_file() and candidate.name.lower() == "steamcmd.exe":
+    valid_names = {"steamcmd.exe"} if sys.platform == "win32" else {"steamcmd.sh", "steamcmd"}
+    if candidate.is_file() and candidate.name.lower() in valid_names:
         return candidate
     return None
 
@@ -249,32 +504,45 @@ def steamcmd_candidates() -> list[Path]:
     candidates: list[Path] = []
     if env_path:
         candidates.append(Path(env_path))
-    which = shutil.which("steamcmd") or shutil.which("steamcmd.exe")
+    which = shutil.which("steamcmd") or shutil.which("steamcmd.sh") or shutil.which("steamcmd.exe")
     if which:
         candidates.append(Path(which))
     home = Path.home()
-    local_app_data = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
-    program_data = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData"))
-    candidates.extend(
-        [
-            executable_dir() / "steamcmd.exe",
-            executable_dir() / "steamcmd" / "steamcmd.exe",
-            app_data_dir() / "SteamCMD" / "steamcmd.exe",
-            home / "steamcmd" / "steamcmd.exe",
-            home / "SteamCMD" / "steamcmd.exe",
-            local_app_data / "SteamCMD" / "steamcmd.exe",
-            local_app_data / "Programs" / "SteamCMD" / "steamcmd.exe",
-            home / "scoop" / "apps" / "steamcmd" / "current" / "steamcmd.exe",
-            program_data / "chocolatey" / "lib" / "steamcmd" / "tools" / "steamcmd.exe",
-            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Steam" / "steamcmd.exe",
-            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Steam" / "steam" / "steamcmd.exe",
-            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "SteamCMD" / "steamcmd.exe",
-            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Steam" / "steamcmd.exe",
-            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Steam" / "steam" / "steamcmd.exe",
-            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "SteamCMD" / "steamcmd.exe",
-            Path(r"C:\steamcmd\steamcmd.exe"),
-        ]
-    )
+    if sys.platform == "darwin":
+        candidates.extend(
+            [
+                executable_dir() / "steamcmd.sh",
+                executable_dir() / "steamcmd" / "steamcmd.sh",
+                app_data_dir() / "SteamCMD" / "steamcmd.sh",
+                home / "steamcmd" / "steamcmd.sh",
+                home / "SteamCMD" / "steamcmd.sh",
+                Path("/usr/local/bin/steamcmd"),
+                Path("/opt/homebrew/bin/steamcmd"),
+            ]
+        )
+    else:
+        local_app_data = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+        program_data = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData"))
+        candidates.extend(
+            [
+                executable_dir() / "steamcmd.exe",
+                executable_dir() / "steamcmd" / "steamcmd.exe",
+                app_data_dir() / "SteamCMD" / "steamcmd.exe",
+                home / "steamcmd" / "steamcmd.exe",
+                home / "SteamCMD" / "steamcmd.exe",
+                local_app_data / "SteamCMD" / "steamcmd.exe",
+                local_app_data / "Programs" / "SteamCMD" / "steamcmd.exe",
+                home / "scoop" / "apps" / "steamcmd" / "current" / "steamcmd.exe",
+                program_data / "chocolatey" / "lib" / "steamcmd" / "tools" / "steamcmd.exe",
+                Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Steam" / "steamcmd.exe",
+                Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Steam" / "steam" / "steamcmd.exe",
+                Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "SteamCMD" / "steamcmd.exe",
+                Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Steam" / "steamcmd.exe",
+                Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Steam" / "steam" / "steamcmd.exe",
+                Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "SteamCMD" / "steamcmd.exe",
+                Path(r"C:\steamcmd\steamcmd.exe"),
+            ]
+        )
     return candidates
 
 
@@ -293,33 +561,49 @@ def find_steamcmd() -> Path | None:
 
 def install_steamcmd(progress) -> Path:
     install_dir = app_data_dir() / "SteamCMD"
-    executable = install_dir / "steamcmd.exe"
+    executable = install_dir / ("steamcmd.sh" if sys.platform == "darwin" else "steamcmd.exe")
     install_dir.mkdir(parents=True, exist_ok=True)
     progress("Downloading SteamCMD from Valve...")
+    download_url = STEAMCMD_DOWNLOAD_URLS.get(sys.platform)
+    if not download_url:
+        raise RuntimeError("Automatic SteamCMD installation is currently supported on Windows and macOS only.")
     request = urllib.request.Request(
-        STEAMCMD_DOWNLOAD_URL,
+        download_url,
         headers={"User-Agent": f"{APP_NAME}/SteamCMD installer"},
     )
     archive_path: Path | None = None
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as archive:
+            suffix = ".tar.gz" if sys.platform == "darwin" else ".zip"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as archive:
                 shutil.copyfileobj(response, archive)
                 archive_path = Path(archive.name)
         progress("Installing SteamCMD...")
-        with zipfile.ZipFile(archive_path) as archive:
-            members = archive.infolist()
-            for member in members:
-                destination = (install_dir / member.filename).resolve()
-                if install_dir.resolve() not in destination.parents and destination != install_dir.resolve():
-                    raise RuntimeError("Valve's SteamCMD archive contained an unsafe path.")
-            archive.extractall(install_dir)
+        install_root = install_dir.resolve()
+        if sys.platform == "darwin":
+            with tarfile.open(archive_path, "r:gz") as archive:
+                for member in archive.getmembers():
+                    destination = (install_dir / member.name).resolve()
+                    if install_root not in destination.parents and destination != install_root:
+                        raise RuntimeError("Valve's SteamCMD archive contained an unsafe path.")
+                    if member.issym() or member.islnk():
+                        raise RuntimeError("Valve's SteamCMD archive contained an unsupported link.")
+                archive.extractall(install_dir)
+            executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        else:
+            with zipfile.ZipFile(archive_path) as archive:
+                members = archive.infolist()
+                for member in members:
+                    destination = (install_dir / member.filename).resolve()
+                    if install_root not in destination.parents and destination != install_root:
+                        raise RuntimeError("Valve's SteamCMD archive contained an unsafe path.")
+                archive.extractall(install_dir)
     finally:
         if archive_path:
             archive_path.unlink(missing_ok=True)
     resolved = resolved_executable_path(executable)
     if not resolved:
-        raise RuntimeError("SteamCMD downloaded, but steamcmd.exe was not found after extraction.")
+        raise RuntimeError(f"SteamCMD downloaded, but {executable.name} was not found after extraction.")
     progress(f"SteamCMD installed at {resolved}")
     return resolved
 
@@ -333,19 +617,28 @@ def find_or_install_steamcmd(progress) -> Path:
 
 
 def rimworld_is_running() -> bool:
-    if sys.platform != "win32":
-        return False
     try:
-        result = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq RimWorld*.exe", "/FO", "CSV"],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=5,
-        )
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq RimWorld*.exe", "/FO", "CSV"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=5,
+            )
+            return "RimWorld" in result.stdout
+        if sys.platform == "darwin":
+            result = subprocess.run(
+                ["pgrep", "-if", "RimWorld"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=5,
+            )
+            return any(line.strip() and line.strip() != str(os.getpid()) for line in result.stdout.splitlines())
     except (OSError, subprocess.SubprocessError):
         return False
-    return "RimWorld" in result.stdout
+    return False
 
 
 def fetch_url(url: str) -> str:
@@ -707,6 +1000,10 @@ def frozen_snapshot_store_path() -> Path:
     return FROZEN_PROFILES_PATH / ".snapshot_store" / "mods"
 
 
+def frozen_blob_store_path() -> Path:
+    return FROZEN_PROFILES_PATH / ".snapshot_store" / "blobs"
+
+
 def directory_size_bytes(path: Path) -> int:
     total = 0
     for root, _directories, files in os.walk(path):
@@ -846,18 +1143,149 @@ def make_tree_readonly(path: Path) -> None:
                 continue
 
 
-def ensure_mod_snapshot(plan: ModSnapshotPlan) -> Path:
-    if plan.reusable and plan.snapshot_path.is_dir():
-        return plan.snapshot_path
-    parent = plan.snapshot_path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    temporary = parent / f".creating_{plan.version_key}_{timestamp()}"
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def content_blob_path(digest: str) -> Path:
+    return frozen_blob_store_path() / digest[:2] / digest[2:]
+
+
+def relink_frozen_file_to_blob(source: Path, blob_path: Path) -> None:
     try:
-        shutil.copytree(plan.source, temporary)
+        if os.path.samefile(source, blob_path):
+            return
+    except OSError:
+        return
+    temporary = source.parent / (
+        f".progression_relink_{threading.get_ident()}_{time.time_ns()}"
+    )
+    try:
+        os.link(blob_path, temporary)
+        try:
+            os.chmod(source, stat.S_IWRITE)
+        except OSError:
+            pass
+        os.replace(temporary, source)
+        try:
+            os.chmod(source, stat.S_IREAD)
+        except OSError:
+            pass
+    except OSError:
+        temporary.unlink(missing_ok=True)
+
+
+def ensure_content_blob(
+    source: Path,
+    digest: str,
+    allow_source_hardlink: bool = False,
+) -> Path:
+    blob_path = content_blob_path(digest)
+    if blob_path.is_file():
+        if allow_source_hardlink:
+            relink_frozen_file_to_blob(source, blob_path)
+        return blob_path
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    if allow_source_hardlink:
+        try:
+            os.link(source, blob_path)
+            return blob_path
+        except FileExistsError:
+            if blob_path.is_file():
+                relink_frozen_file_to_blob(source, blob_path)
+                return blob_path
+        except OSError:
+            pass
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=blob_path.parent,
+            prefix=f".creating_{digest[2:14]}_",
+            delete=False,
+        ) as target:
+            temporary = Path(target.name)
+            with source.open("rb") as source_file:
+                shutil.copyfileobj(source_file, target, length=1024 * 1024)
+        if blob_path.exists():
+            temporary.unlink(missing_ok=True)
+        else:
+            temporary.replace(blob_path)
+        return blob_path
+    except Exception:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+
+
+def create_hardlink_or_copy(source: Path, target: Path) -> None:
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+
+
+def build_content_addressed_snapshot(
+    source: Path,
+    snapshot_path: Path,
+    item_id: str,
+    version_key: str,
+    logical_size: int,
+    allow_source_hardlinks: bool = False,
+) -> Path:
+    marker_path = snapshot_path / ".snapshot_complete.json"
+    if snapshot_path.is_dir() and marker_path.is_file():
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            marker = {}
+        if marker.get("storage") == "content-addressed-v1":
+            return snapshot_path
+    parent = snapshot_path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(
+            prefix=f".creating_{version_key}_",
+            dir=parent,
+        )
+    )
+    try:
+        tree_digest = hashlib.sha256()
+        file_count = 0
+        for root, directories, files in os.walk(source):
+            directories.sort(key=str.lower)
+            files.sort(key=str.lower)
+            source_root = Path(root)
+            relative_root = source_root.relative_to(source)
+            target_root = temporary / relative_root
+            target_root.mkdir(parents=True, exist_ok=True)
+            for directory in directories:
+                (target_root / directory).mkdir(exist_ok=True)
+            for filename in files:
+                source_file = source_root / filename
+                relative_path = source_file.relative_to(source).as_posix()
+                digest = file_sha256(source_file)
+                blob_path = ensure_content_blob(
+                    source_file,
+                    digest,
+                    allow_source_hardlink=allow_source_hardlinks,
+                )
+                create_hardlink_or_copy(blob_path, target_root / filename)
+                tree_digest.update(relative_path.encode("utf-8", errors="surrogatepass"))
+                tree_digest.update(b"\0")
+                tree_digest.update(digest.encode("ascii"))
+                tree_digest.update(b"\n")
+                file_count += 1
         marker = {
-            "item_id": plan.item_id,
-            "version_key": plan.version_key,
-            "logical_size": plan.logical_size,
+            "item_id": item_id,
+            "version_key": version_key,
+            "logical_size": logical_size,
+            "storage": "content-addressed-v1",
+            "tree_digest": tree_digest.hexdigest(),
+            "file_count": file_count,
             "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
         }
         (temporary / ".snapshot_complete.json").write_text(
@@ -865,10 +1293,10 @@ def ensure_mod_snapshot(plan: ModSnapshotPlan) -> Path:
             encoding="utf-8",
         )
         make_tree_readonly(temporary)
-        if plan.snapshot_path.exists():
-            remove_tree(plan.snapshot_path)
-        temporary.rename(plan.snapshot_path)
-        return plan.snapshot_path
+        if snapshot_path.exists():
+            remove_tree(snapshot_path)
+        temporary.rename(snapshot_path)
+        return snapshot_path
     except Exception:
         if temporary.exists():
             try:
@@ -876,6 +1304,76 @@ def ensure_mod_snapshot(plan: ModSnapshotPlan) -> Path:
             except OSError:
                 pass
         raise
+
+
+def ensure_mod_snapshot(plan: ModSnapshotPlan) -> Path:
+    return build_content_addressed_snapshot(
+        plan.source,
+        plan.snapshot_path,
+        plan.item_id,
+        plan.version_key,
+        plan.logical_size,
+    )
+
+
+def migrate_existing_frozen_snapshots(progress=None) -> int:
+    migrated = 0
+    for profile_name in frozen_profile_names():
+        profile_migrated = 0
+        try:
+            manifest = load_frozen_manifest(profile_name)
+        except RuntimeError:
+            continue
+        entries = manifest.get("mods", [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            item_id = str(entry.get("item_id", ""))
+            version_key = str(entry.get("snapshot_version", ""))
+            if not item_id.isdigit() or not version_key:
+                continue
+            source = frozen_game_path(profile_name) / "Mods" / item_id
+            if not source.is_dir():
+                continue
+            relative_snapshot = entry.get("snapshot")
+            if isinstance(relative_snapshot, str) and relative_snapshot:
+                snapshot_path = FROZEN_PROFILES_PATH / relative_snapshot
+            else:
+                snapshot_path = frozen_snapshot_store_path() / item_id / version_key
+            marker_path = snapshot_path / ".snapshot_complete.json"
+            if marker_path.is_file():
+                try:
+                    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    marker = {}
+                if marker.get("storage") == "content-addressed-v1":
+                    continue
+            if progress:
+                progress(
+                    f"Deduplicating existing frozen profile '{profile_name}' mod {item_id}..."
+                )
+            build_content_addressed_snapshot(
+                source,
+                snapshot_path,
+                item_id,
+                version_key,
+                directory_size_bytes(source),
+                allow_source_hardlinks=True,
+            )
+            entry["snapshot"] = str(snapshot_path.relative_to(FROZEN_PROFILES_PATH))
+            migrated += 1
+            profile_migrated += 1
+        if profile_migrated:
+            manifest["content_addressed_mod_storage"] = True
+            manifest_path = frozen_profile_path(profile_name) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if progress and migrated:
+        progress(
+            f"Deduplicated {migrated} existing frozen mod snapshot(s) without copying their file data."
+        )
+    return migrated
 
 
 def hardlink_snapshot_tree(source: Path, target: Path) -> None:
@@ -890,10 +1388,46 @@ def hardlink_snapshot_tree(source: Path, target: Path) -> None:
                 continue
             source_file = Path(root) / filename
             target_file = target_root / filename
-            try:
-                os.link(source_file, target_file)
-            except OSError:
-                shutil.copy2(source_file, target_file)
+            create_hardlink_or_copy(source_file, target_file)
+
+
+def compress_frozen_blob_store(progress=None) -> bool:
+    blob_root = frozen_blob_store_path()
+    if sys.platform != "win32" or not blob_root.exists():
+        return False
+    if progress:
+        progress("Applying transparent Windows compression to frozen mod storage...")
+    command = [
+        "compact.exe",
+        "/C",
+        f"/S:{blob_root}",
+        "/I",
+        "/Q",
+        "/EXE:LZX",
+    ]
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            creationflags=creation_flags,
+            check=False,
+        )
+    except OSError as exc:
+        if progress:
+            progress(f"Windows transparent compression was unavailable; continuing uncompressed: {exc}")
+        return False
+    if completed.returncode == 0:
+        if progress:
+            progress("Transparent compression applied; frozen mods remain directly launchable.")
+        return True
+    if progress:
+        details = (completed.stderr or completed.stdout).strip()
+        suffix = f": {details[-500:]}" if details else ""
+        progress(f"Windows could not compress frozen mod storage; continuing uncompressed{suffix}")
+    return False
 
 
 def referenced_snapshot_paths() -> set[Path]:
@@ -914,30 +1448,66 @@ def referenced_snapshot_paths() -> set[Path]:
 
 def cleanup_unreferenced_mod_snapshots(progress=None) -> tuple[int, int]:
     store_root = frozen_snapshot_store_path()
-    if not store_root.exists():
-        return 0, 0
     references = referenced_snapshot_paths()
     removed = 0
     reclaimed = 0
-    for item_root in list(store_root.iterdir()):
-        if not item_root.is_dir():
-            continue
-        for version_root in list(item_root.iterdir()):
-            if not version_root.is_dir() or version_root.name.startswith(".creating_"):
+    if store_root.exists():
+        for item_root in list(store_root.iterdir()):
+            if not item_root.is_dir():
                 continue
-            if version_root.resolve() in references:
+            for version_root in list(item_root.iterdir()):
+                if not version_root.is_dir() or version_root.name.startswith(".creating_"):
+                    continue
+                if version_root.resolve() in references:
+                    continue
+                size = 0
+                for root, _directories, files in os.walk(version_root):
+                    for filename in files:
+                        try:
+                            stat_result = (Path(root) / filename).stat()
+                        except OSError:
+                            continue
+                        if stat_result.st_nlink <= 1:
+                            size += stat_result.st_size
+                remove_tree(version_root)
+                removed += 1
+                reclaimed += size
+            try:
+                item_root.rmdir()
+            except OSError:
+                pass
+    removed_blobs = 0
+    blob_root = frozen_blob_store_path()
+    if blob_root.exists():
+        for prefix_root in list(blob_root.iterdir()):
+            if not prefix_root.is_dir():
                 continue
-            size = directory_size_bytes(version_root)
-            remove_tree(version_root)
-            removed += 1
-            reclaimed += size
-        try:
-            item_root.rmdir()
-        except OSError:
-            pass
-    if progress and removed:
+            for blob_path in list(prefix_root.iterdir()):
+                if not blob_path.is_file():
+                    continue
+                if blob_path.name.startswith(".creating_"):
+                    try:
+                        blob_path.unlink()
+                    except OSError:
+                        pass
+                    continue
+                try:
+                    stat_result = blob_path.stat()
+                except OSError:
+                    continue
+                if stat_result.st_nlink > 1:
+                    continue
+                reclaimed += stat_result.st_size
+                blob_path.unlink()
+                removed_blobs += 1
+            try:
+                prefix_root.rmdir()
+            except OSError:
+                pass
+    if progress and (removed or removed_blobs):
         progress(
-            f"Removed {removed} unreferenced shared mod snapshot(s), reclaiming "
+            f"Removed {removed} unreferenced shared mod snapshot(s) and "
+            f"{removed_blobs} deduplicated mod file(s), reclaiming "
             f"{format_file_size(reclaimed)}."
         )
     return removed, reclaimed
@@ -1357,14 +1927,37 @@ def frozen_active_item_ids(result: ScanResult) -> list[str]:
 
 
 def rimworld_executable(game_root: Path) -> Path | None:
-    candidates = [
-        game_root / "RimWorldWin64.exe",
-        game_root / "RimWorldWin.exe",
-    ]
+    if sys.platform == "darwin" or game_root.suffix.lower() == ".app":
+        candidates = [
+            game_root / "Contents" / "MacOS" / "RimWorldMac",
+            game_root / "Contents" / "MacOS" / "RimWorld",
+            game_root / "RimWorldMac",
+        ]
+        info_plist = game_root / "Contents" / "Info.plist"
+        if info_plist.exists():
+            try:
+                with info_plist.open("rb") as handle:
+                    executable_name = plistlib.load(handle).get("CFBundleExecutable")
+                if executable_name:
+                    candidates.insert(0, game_root / "Contents" / "MacOS" / str(executable_name))
+            except (OSError, plistlib.InvalidFileException):
+                pass
+    else:
+        candidates = [
+            game_root / "RimWorldWin64.exe",
+            game_root / "RimWorldWin.exe",
+        ]
     for candidate in candidates:
         if candidate.is_file():
             return candidate
     return None
+
+
+def rimworld_game_root_from_mods_path(local_mods_path: Path) -> Path:
+    parent = local_mods_path.parent
+    if parent.name == "Resources" and parent.parent.name == "Contents" and parent.parent.parent.suffix.lower() == ".app":
+        return parent.parent.parent
+    return parent
 
 
 def copy_rimworld_game_snapshot(game_root: Path, target: Path, progress) -> None:
@@ -1374,8 +1967,10 @@ def copy_rimworld_game_snapshot(game_root: Path, target: Path, progress) -> None
     progress("Freezing RimWorld game files...")
 
     def ignore_live_mods(directory: str, names: list[str]) -> set[str]:
-        if Path(directory).resolve() != game_root.resolve():
-            return set()
+        current = Path(directory).resolve()
+        if current != game_root.resolve():
+            if current != (game_root / "Contents" / "Resources").resolve():
+                return set()
         return {
             name
             for name in names
@@ -1391,11 +1986,13 @@ def estimate_frozen_profile_size(
     active_ids: list[str],
     selected_save_names: list[str],
 ) -> tuple[int, int, int, int, list[ModSnapshotPlan]]:
-    game_root = result.local_mods_path.parent
+    game_root = rimworld_game_root_from_mods_path(result.local_mods_path)
 
     def ignore_live_mods(directory: str, names: list[str]) -> set[str]:
-        if Path(directory).resolve() != game_root.resolve():
-            return set()
+        current = Path(directory).resolve()
+        if current != game_root.resolve():
+            if current != (game_root / "Contents" / "Resources").resolve():
+                return set()
         return {
             name
             for name in names
@@ -1437,10 +2034,11 @@ def create_frozen_profile(
         raise RuntimeError(f"Frozen profile already exists: {profile_name}")
     FROZEN_PROFILES_PATH.mkdir(parents=True, exist_ok=True)
     profile_root = FROZEN_PROFILES_PATH / f".creating_{profile_name}_{timestamp()}"
-    game_root = result.local_mods_path.parent
+    game_root = rimworld_game_root_from_mods_path(result.local_mods_path)
     game_target = profile_root / "Game"
     mods_root = game_target / "Mods"
     try:
+        migrate_existing_frozen_snapshots(progress)
         copy_rimworld_game_snapshot(game_root, game_target, progress)
         entries: list[dict[str, str]] = []
         total = len(active_ids)
@@ -1469,6 +2067,7 @@ def create_frozen_profile(
             )
             if progress_count is not None:
                 progress_count(index, total)
+        transparent_compression = compress_frozen_blob_store(progress)
         user_data_source = result.mods_config_path.parent.parent
         user_data_target = profile_root / "UserData"
         if user_data_source.exists():
@@ -1485,16 +2084,24 @@ def create_frozen_profile(
             game_version = version_path.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             game_version = ""
+        frozen_executable = rimworld_executable(game_target)
+        executable_manifest_path = (
+            frozen_executable.relative_to(game_target).as_posix()
+            if frozen_executable is not None
+            else ""
+        )
         manifest = {
-            "format_version": 4,
+            "format_version": 5,
             "name": profile_name,
             "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
             "game_version": game_version,
-            "game_executable": "RimWorldWin64.exe",
+            "game_executable": executable_manifest_path,
             "user_data": "UserData",
             "selected_saves": selected_save_names,
             "compact_user_data": True,
             "shared_mod_snapshots": True,
+            "content_addressed_mod_storage": True,
+            "transparent_mod_compression": transparent_compression,
             "item_ids": active_ids,
             "mods": entries,
         }
@@ -1705,16 +2312,22 @@ def prepare_steamcmd_local_download_root(steamcmd_root: Path, local_mods_path: P
             downloaded_root.rmdir()
 
     progress(f"Linking SteamCMD content folder to RimWorld local Mods: {local_mods_path}")
-    completed = subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(downloaded_root), str(local_mods_path)],
-        cwd=str(content_parent),
-        capture_output=True,
-        text=True,
-        errors="replace",
-    )
-    if completed.returncode != 0:
-        details = (completed.stdout + "\n" + completed.stderr).strip()
-        raise RuntimeError(f"Failed to create SteamCMD local-mod junction. {details}")
+    if sys.platform == "win32":
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(downloaded_root), str(local_mods_path)],
+            cwd=str(content_parent),
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+        if completed.returncode != 0:
+            details = (completed.stdout + "\n" + completed.stderr).strip()
+            raise RuntimeError(f"Failed to create SteamCMD local-mod junction. {details}")
+    else:
+        try:
+            downloaded_root.symlink_to(local_mods_path.resolve(), target_is_directory=True)
+        except OSError as exc:
+            raise RuntimeError(f"Failed to create SteamCMD local-mod symlink: {exc}")
     return downloaded_root
 
 
@@ -2502,6 +3115,9 @@ class ProgressorApp(tk.Tk):
         self.mod_context_menu: tk.Menu | None = None
         self.mod_search_after_id: str | None = None
         self.frozen_frame: ttk.Frame | None = None
+        self.paths_frame: ttk.LabelFrame | None = None
+        self.main_pane: ttk.PanedWindow | None = None
+        self.mod_table_frame: ttk.Frame | None = None
         self.frozen_visible = False
 
         self._build_ui()
@@ -2614,6 +3230,7 @@ class ProgressorApp(tk.Tk):
         self.advanced_frame.columnconfigure(0, weight=1)
 
         paths = ttk.LabelFrame(self.advanced_frame, text="Paths", padding=12)
+        self.paths_frame = paths
         paths.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         paths.columnconfigure(1, weight=1)
         ttk.Label(paths, text="Steam Workshop Mods").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
@@ -2708,6 +3325,7 @@ class ProgressorApp(tk.Tk):
         self.frozen_frame.grid_remove()
 
         main = ttk.PanedWindow(self, orient="horizontal")
+        self.main_pane = main
         main.grid(row=4, column=0, sticky="nsew", padx=18, pady=(0, 14))
 
         left = ttk.Frame(main)
@@ -2730,6 +3348,7 @@ class ProgressorApp(tk.Tk):
         main.add(left, weight=1)
 
         right = ttk.Frame(main)
+        self.mod_table_frame = right
         right.columnconfigure(0, weight=1)
         right.rowconfigure(2, weight=1)
         header_row = ttk.Frame(right)
@@ -2811,8 +3430,6 @@ class ProgressorApp(tk.Tk):
             label="Copy Workshop URL",
             command=self.copy_selected_workshop_url,
         )
-        main.add(right, weight=2)
-
         self.refresh_frozen_profiles()
         self.progress("Ready. Press Play Now for the full automatic setup, or open Advanced Options for manual controls.")
 
@@ -3026,7 +3643,15 @@ class ProgressorApp(tk.Tk):
         if self.advanced_visible:
             self.update_idletasks()
             self.compact_window_geometry = (self.winfo_width(), self.winfo_height())
+            if self.paths_frame is not None:
+                self.paths_frame.grid()
             self.advanced_frame.grid(row=2, column=0, sticky="ew")
+            if (
+                self.main_pane is not None
+                and self.mod_table_frame is not None
+                and str(self.mod_table_frame) not in self.main_pane.panes()
+            ):
+                self.main_pane.add(self.mod_table_frame, weight=2)
             self.advanced_button.configure(text="Hide Advanced Options")
             self.update_idletasks()
             width, height = self.compact_window_geometry
@@ -3036,7 +3661,15 @@ class ProgressorApp(tk.Tk):
             )
             self.geometry(f"{width}x{expanded_height}")
         else:
+            if self.paths_frame is not None:
+                self.paths_frame.grid_remove()
             self.advanced_frame.grid_remove()
+            if (
+                self.main_pane is not None
+                and self.mod_table_frame is not None
+                and str(self.mod_table_frame) in self.main_pane.panes()
+            ):
+                self.main_pane.forget(self.mod_table_frame)
             self.advanced_button.configure(text="Show Advanced Options")
             if self.compact_window_geometry is not None:
                 width, height = self.compact_window_geometry
@@ -3093,9 +3726,10 @@ class ProgressorApp(tk.Tk):
     def choose_steamcmd(self) -> None:
         initial = self.steamcmd_path.get()
         initial_dir = str(Path(initial).parent) if initial else str(Path.home())
+        steamcmd_pattern = "steamcmd.sh" if sys.platform == "darwin" else "steamcmd.exe"
         path = filedialog.askopenfilename(
             initialdir=initial_dir,
-            filetypes=[("SteamCMD", "steamcmd.exe"), ("Executables", "*.exe"), ("All files", "*.*")],
+            filetypes=[("SteamCMD", steamcmd_pattern), ("Executables", "*"), ("All files", "*.*")],
         )
         if path:
             resolved = resolved_executable_path(path)
@@ -3701,6 +4335,7 @@ class ProgressorApp(tk.Tk):
 
         def worker() -> None:
             try:
+                migrate_existing_frozen_snapshots(self.progress)
                 active_ids = frozen_active_item_ids(result)
                 self.progress(
                     f"Estimating compact frozen profile size for {len(active_ids)} mods and "
@@ -4239,11 +4874,18 @@ class ProgressorApp(tk.Tk):
 
 
 def main() -> int:
-    if sys.platform != "win32":
-        print("Progression Launcher is Windows-first right now. It can scan on other OSes, but paths may need manual setup.")
-    app = ProgressorApp()
-    app.mainloop()
-    return 0
+    if sys.platform not in {"win32", "darwin"}:
+        print("Progression Launcher supports Windows and macOS right now. Other OSes may need manual setup.")
+    acquired, existing_processes = acquire_single_instance()
+    if not acquired:
+        show_single_instance_warning(existing_processes)
+        return 1
+    try:
+        app = ProgressorApp()
+        app.mainloop()
+        return 0
+    finally:
+        release_single_instance()
 
 
 if __name__ == "__main__":

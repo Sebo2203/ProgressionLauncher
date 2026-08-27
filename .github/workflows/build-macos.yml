@@ -1,0 +1,82 @@
+name: Build macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to attach the macOS test build to"
+        required: true
+        default: "v0.4.3-macos-test"
+      release_name:
+        description: "Release title"
+        required: true
+        default: "Progression Launcher v0.4.3 macOS Test"
+  push:
+    branches:
+      - master
+    paths:
+      - "progressor.py"
+      - "progression_logo.png"
+      - "collection_cache.json"
+      - "build_macos.sh"
+      - "tests/macos_compat_smoke.py"
+      - "MAC_TESTER.md"
+      - ".github/workflows/build-macos.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: Build macOS app
+    runs-on: macos-latest
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || 'v0.4.3-macos-test' }}
+      RELEASE_NAME: ${{ github.event.inputs.release_name || 'Progression Launcher v0.4.3 macOS Test' }}
+      MAC_ZIP: ProgressionLauncher-macOS-v0.4.3-candidate.1.zip
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run macOS compatibility smoke test
+        run: python tests/macos_compat_smoke.py
+
+      - name: Build app bundle
+        run: |
+          chmod +x build_macos.sh
+          ./build_macos.sh
+
+      - name: Ad-hoc sign app bundle
+        run: codesign --force --deep --sign - ../dist/Progression\ Launcher.app
+
+      - name: Package app bundle
+        run: |
+          cd ../dist
+          ditto -c -k --sequesterRsrc --keepParent "Progression Launcher.app" "$MAC_ZIP"
+          shasum -a 256 "$MAC_ZIP" > "$MAC_ZIP.sha256"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Progression-Launcher-macOS
+          path: |
+            ../dist/${{ env.MAC_ZIP }}
+            ../dist/${{ env.MAC_ZIP }}.sha256
+
+      - name: Publish macOS test release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_NAME }}
+          prerelease: true
+          make_latest: false
+          body_path: MAC_TESTER.md
+          files: |
+            ../dist/${{ env.MAC_ZIP }}
+            ../dist/${{ env.MAC_ZIP }}.sha256
