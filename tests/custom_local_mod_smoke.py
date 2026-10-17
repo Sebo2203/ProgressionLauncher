@@ -35,6 +35,7 @@ with tempfile.TemporaryDirectory() as temp:
     write_mod(workshop / '12345', 'ferny.worldbuilder')
     (local / 'unfinished folder').mkdir()
     game.joinpath('RimWorldWin64.exe').write_text('fixture executable', encoding='utf-8')
+    game.joinpath('RimWorldMac').write_text('fixture executable', encoding='utf-8')
     config = root / 'UserData' / 'Config' / 'ModsConfig.xml'
     config.parent.mkdir(parents=True)
     config.write_text('<ModsConfigData><activeMods><li>ludeon.rimworld</li>'
