@@ -30,7 +30,7 @@ import tkinter as tk
 
 APP_ID = "294100"
 APP_NAME = "Progression Launcher"
-APP_VERSION = "0.4.3"
+APP_VERSION = "0.4.4"
 COLLECTIONS = {
     "Core": "3521297585",
     "Content": "3521319712",
@@ -853,6 +853,15 @@ def save_collection_cache(items: dict[str, WorkshopItem]) -> None:
     CACHE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def valid_mod_item_id(item_id: str) -> bool:
+    """Workshop ID or a stable local-package key, safe as a snapshot folder name."""
+    return bool(re.fullmatch(r"[0-9]+|local\.[0-9a-f]{16}", item_id))
+
+
+def mod_item_sort_key(item_id: str) -> tuple[int, int | str]:
+    return (0, int(item_id)) if item_id.isdigit() else (1, item_id)
+
+
 def load_always_enabled_ids() -> set[str]:
     if not ALWAYS_ENABLED_PATH.exists():
         return set()
@@ -861,12 +870,12 @@ def load_always_enabled_ids() -> set[str]:
     except (OSError, json.JSONDecodeError):
         return set()
     ids = payload.get("item_ids", [])
-    return {str(item_id) for item_id in ids if str(item_id).isdigit()}
+    return {str(item_id) for item_id in ids if valid_mod_item_id(str(item_id))}
 
 
 def save_always_enabled_ids(item_ids: set[str]) -> None:
     ALWAYS_ENABLED_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"item_ids": sorted(item_ids, key=int)}
+    payload = {"item_ids": sorted(item_ids, key=mod_item_sort_key)}
     ALWAYS_ENABLED_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -878,12 +887,12 @@ def load_disabled_ids() -> set[str]:
     except (OSError, json.JSONDecodeError):
         return set()
     ids = payload.get("item_ids", [])
-    return {str(item_id) for item_id in ids if str(item_id).isdigit()}
+    return {str(item_id) for item_id in ids if valid_mod_item_id(str(item_id))}
 
 
 def save_disabled_ids(item_ids: set[str]) -> None:
     DISABLED_MODS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"item_ids": sorted(item_ids, key=int)}
+    payload = {"item_ids": sorted(item_ids, key=mod_item_sort_key)}
     DISABLED_MODS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -1332,7 +1341,7 @@ def migrate_existing_frozen_snapshots(progress=None) -> int:
                 continue
             item_id = str(entry.get("item_id", ""))
             version_key = str(entry.get("snapshot_version", ""))
-            if not item_id.isdigit() or not version_key:
+            if not valid_mod_item_id(item_id) or not version_key:
                 continue
             source = frozen_game_path(profile_name) / "Mods" / item_id
             if not source.is_dir():
@@ -1728,7 +1737,7 @@ def read_installed_metadata(item_paths: dict[str, Path], item_ids: list[str]) ->
     return metadata
 
 
-def scan_mod_folder(root_path: Path) -> tuple[set[str], dict[str, str], dict[str, Path]]:
+def scan_mod_folder(root_path: Path, *, include_custom: bool = False) -> tuple[set[str], dict[str, str], dict[str, Path]]:
     installed_ids: set[str] = set()
     package_ids: dict[str, str] = {}
     item_paths: dict[str, Path] = {}
@@ -1736,15 +1745,36 @@ def scan_mod_folder(root_path: Path) -> tuple[set[str], dict[str, str], dict[str
         return installed_ids, package_ids, item_paths
 
     for child in root_path.iterdir():
-        if not child.is_dir() or not child.name.isdigit():
+        if not child.is_dir() or child.name.startswith("."):
             continue
-        installed_ids.add(child.name)
-        item_paths[child.name] = child
+        if not child.name.isdigit() and not include_custom:
+            continue
         metadata = cached_mod_metadata(child, child.name)
+        if child.name.isdigit():
+            item_id = child.name
+        elif metadata and metadata.package_id:
+            # Package identity survives folder renames and distinguishes local mods
+            # from Workshop items without inventing a Steam published-file ID.
+            item_id = "local." + hashlib.sha256(metadata.package_id.lower().encode("utf-8")).hexdigest()[:16]
+        else:
+            continue
+        if item_id in item_paths:
+            raise RuntimeError(f"Duplicate local mod package in {item_paths[item_id]} and {child}")
+        installed_ids.add(item_id)
+        item_paths[item_id] = child
         if metadata and metadata.package_id:
-            package_ids[child.name] = metadata.package_id
+            package_ids[item_id] = metadata.package_id
     save_local_metadata_cache()
     return installed_ids, package_ids, item_paths
+
+
+def extra_mod_label(result: ScanResult, item_id: str) -> str:
+    package_id = result.installed_package_ids.get(item_id, "")
+    path = result.item_paths.get(item_id)
+    metadata = cached_mod_metadata(path, item_id) if path else None
+    name = metadata.name if metadata else package_id or item_id
+    label = f"{name}  [{package_id}]" if package_id else name
+    return f"{item_id}  {label}" if item_id.isdigit() else label
 
 
 def find_quarantined_mods(workshop_path: Path) -> list[QuarantinedMod]:
@@ -1792,7 +1822,7 @@ def scan_with_required(
     progress("Scanning local Workshop folder...")
     workshop_ids, workshop_package_ids, workshop_paths = scan_mod_folder(workshop_path)
     progress("Scanning RimWorld local Mods folder...")
-    local_ids, local_package_ids, local_paths = scan_mod_folder(local_mods_path)
+    local_ids, local_package_ids, local_paths = scan_mod_folder(local_mods_path, include_custom=True)
     reused_metadata = _local_metadata_cache_hits - cache_hits_before
     if reused_metadata:
         progress(f"Reused stat-verified metadata for {reused_metadata} unchanged local mod files.")
@@ -1823,11 +1853,11 @@ def scan_with_required(
         installed_ids=installed_ids,
         installed_package_ids=package_ids,
         item_paths=item_paths,
-        local_steamcmd_ids=local_ids,
+        local_steamcmd_ids={item_id for item_id in local_ids if item_id.isdigit()},
         steam_registered_ids=steam_ready_ids,
         missing_ids=[item_id for item_id in required_order if item_id not in installed_ids],
         unregistered_ids=[item_id for item_id in required_order if item_id in workshop_ids and item_id not in ready_ids],
-        extra_ids=sorted(installed_ids - required_ids, key=int),
+        extra_ids=sorted(installed_ids - required_ids, key=mod_item_sort_key),
         ready_ids=[item_id for item_id in required_order if item_id in ready_ids],
         always_enabled_ids=always_enabled_ids,
         disabled_ids=disabled_ids,
@@ -2124,7 +2154,7 @@ def stage_frozen_profile(
     progress_count=None,
 ) -> FrozenStageResult:
     manifest = load_frozen_manifest(profile_name)
-    item_ids = [str(item_id) for item_id in manifest.get("item_ids", []) if str(item_id).isdigit()]
+    item_ids = [str(item_id) for item_id in manifest.get("item_ids", []) if valid_mod_item_id(str(item_id))]
     format_version = int(manifest.get("format_version", 1) or 1)
     if format_version < 2:
         raise RuntimeError(
@@ -2188,15 +2218,35 @@ def parse_workshop_update_times(manifest_path: Path) -> dict[str, int]:
         text = manifest_path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return {}
-    update_times: dict[str, int] = {}
-    for match in re.finditer(r'"(?P<id>\d{7,})"\s*\{(?P<body>.*?)\n\s*\}', text, re.DOTALL):
-        item_id = match.group("id")
-        body = match.group("body")
-        time_match = re.search(r'"timeupdated"\s*"(?P<time>\d+)"', body, re.IGNORECASE)
-        if not time_match:
-            continue
-        update_times[item_id] = int(time_match.group("time"))
-    return update_times
+    # Only installed records certify file content. WorkshopItemDetails is a
+    # metadata cache and can describe a newer version that has not downloaded.
+    tokens = re.findall(r'"(?:\\.|[^"\\])*"|[{}]', text)
+    def read_map(index: int) -> tuple[dict, int]:
+        result = {}
+        while index < len(tokens) and tokens[index] != "}":
+            key = tokens[index]
+            if not key.startswith('"') or index + 1 >= len(tokens):
+                raise ValueError("Invalid Workshop manifest")
+            index += 1
+            if tokens[index] == "{":
+                value, index = read_map(index + 1)
+            elif tokens[index].startswith('"'):
+                value = tokens[index][1:-1]
+                index += 1
+            else:
+                raise ValueError("Invalid Workshop value")
+            result[key[1:-1]] = value
+        return result, index + 1
+    try:
+        document, _ = read_map(0)
+        installed = document.get("AppWorkshop", document).get("WorkshopItemsInstalled", {})
+        return {
+            str(item_id): int(record["timeupdated"])
+            for item_id, record in installed.items()
+            if str(item_id).isdigit() and isinstance(record, dict) and str(record.get("timeupdated", "")).isdigit()
+        }
+    except (ValueError, AttributeError, KeyError, TypeError):
+        return {}
 
 
 def parse_steamcmd_update_times(steamcmd_root: Path) -> dict[str, int]:
@@ -2238,23 +2288,72 @@ def workshop_outdated_ids(
     item_ids: list[str],
     manifest_path: Path,
     remote_times: dict[str, int],
-    fallback_manifest_paths: list[Path] | None = None,
+    refresh_untracked: bool = False,
 ) -> tuple[list[str], list[str]]:
     local_times = parse_workshop_update_times(manifest_path)
-    for fallback_path in fallback_manifest_paths or []:
-        fallback_times = parse_workshop_update_times(fallback_path)
-        for item_id, update_time in fallback_times.items():
-            local_times.setdefault(item_id, update_time)
     outdated: list[str] = []
     unknown: list[str] = []
     for item_id in item_ids:
         local_time = local_times.get(item_id)
         remote_time = remote_times.get(item_id)
-        if local_time is None or remote_time is None:
+        if remote_time is None:
             unknown.append(item_id)
+        elif local_time is None:
+            # A Steam subscription's manifest cannot certify a separate local copy.
+            if refresh_untracked:
+                outdated.append(item_id)
+            else:
+                unknown.append(item_id)
         elif remote_time > local_time:
             outdated.append(item_id)
     return outdated, unknown
+
+
+def reuse_current_workshop_copies(result: ScanResult, candidates: list[str], remote_times: dict[str, int], progress) -> list[str]:
+    """Back up stale/untracked duplicate locals so RimWorld loads Steam's current copy."""
+    installed_times = parse_workshop_update_times(steam_client_acf_path(result.workshop_path))
+    eligible = []
+    local_root = result.local_mods_path.resolve()
+    workshop_root = result.workshop_path.resolve()
+    for item_id in candidates:
+        if not item_id.isdigit() or item_id not in result.local_steamcmd_ids:
+            continue
+        remote = remote_times.get(item_id)
+        if remote is None or installed_times.get(item_id, -1) < remote:
+            continue
+        local = result.local_mods_path / item_id
+        workshop = result.workshop_path / item_id
+        if not local.is_dir() or not workshop.is_dir():
+            continue
+        # Never move the root, a redirected child or an unrelated folder.
+        if local.resolve().parent != local_root or workshop.resolve().parent != workshop_root:
+            continue
+        local_package = read_package_id(local)
+        if not local_package or read_package_id(workshop) != local_package:
+            continue
+        eligible.append((item_id, local, workshop))
+    if not eligible:
+        return []
+    if rimworld_is_running():
+        raise RuntimeError("Close RimWorld before switching duplicate mod copies.")
+    repair_root = app_data_dir().resolve() / "repair_backups"
+    repair_root.mkdir(parents=True, exist_ok=True)
+    backup_root = Path(tempfile.mkdtemp(prefix="duplicate-local-mods-", dir=repair_root)).resolve()
+    if backup_root.parent != repair_root:
+        raise RuntimeError("Unexpected duplicate-mod backup path.")
+    records = []
+    reused = []
+    for item_id, local, workshop in eligible:
+        target = backup_root / item_id
+        if local.resolve().parent != local_root or target.resolve().parent != backup_root or target.exists():
+            raise RuntimeError(f"Unexpected duplicate-mod move path for {item_id}.")
+        progress(f"Using the current Steam Workshop copy of {item_id}; preserving the separate local copy in backup.")
+        shutil.move(str(local), str(target))
+        records.append({"item_id": item_id, "original_local": str(local), "backup": str(target), "active_workshop": str(workshop), "remote_updated": remote_times[item_id]})
+        (backup_root / "restoration.json").write_text(json.dumps(records, indent=2), encoding="utf-8")
+        reused.append(item_id)
+    progress(f"Reused {len(reused)} already-updated Steam Workshop mod(s), avoiding SteamCMD downloads. Backups: {backup_root}")
+    return reused
 
 
 def path_is_junction_or_link(path: Path) -> bool:
@@ -2466,6 +2565,70 @@ def run_steamcmd_downloads(
     return downloaded_root
 
 
+def texture_optimizer_executable() -> Path:
+    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    executable = root / "todds" / ("todds.exe" if sys.platform == "win32" else "todds")
+    if not executable.is_file():
+        raise RuntimeError("The bundled todds texture encoder is missing. Reinstall the latest launcher build.")
+    return executable
+
+
+def texture_optimization_paths(result: ScanResult) -> list[Path]:
+    """Match the next live PLAY NOW profile, including opted-in custom mods."""
+    if result.missing_ids or result.unregistered_ids:
+        raise RuntimeError("Download missing mods with PLAY NOW before optimizing textures.")
+    if result.always_enabled_ids - result.installed_ids:
+        raise RuntimeError("An Always Enabled mod is missing. Restore it before optimizing textures.")
+    selected = set(result.ready_ids) - result.disabled_ids
+    selected.update(result.always_enabled_ids)
+    roots = {result.local_mods_path.resolve(), result.workshop_path.resolve()}
+    paths = []
+    for item_id in sorted(selected, key=mod_item_sort_key):
+        path = result.item_paths.get(item_id)
+        if path is None or not path.is_dir() or path.resolve().parent not in roots:
+            raise RuntimeError(f"Cannot safely locate texture folder for mod {item_id}.")
+        if path.resolve() not in paths:
+            paths.append(path.resolve())
+    if not paths:
+        raise RuntimeError("No enabled live mods were found to optimize.")
+    return paths
+
+
+def run_texture_optimization(result: ScanResult, progress) -> Path:
+    if rimworld_is_running():
+        raise RuntimeError("Close RimWorld before optimizing textures.")
+    paths = texture_optimization_paths(result)
+    executable = texture_optimizer_executable()
+    log_root = app_data_dir() / "texture_optimization"
+    log_root.mkdir(parents=True, exist_ok=True)
+    log_path = log_root / ("todds-" + _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".log")
+    # Same optimized preset as RimSort: BC1 opaque / BC7 alpha, no downscaling,
+    # preserve PNGs and skip existing DDS unless its PNG has been updated.
+    with tempfile.TemporaryDirectory(prefix="progression-todds-") as temporary:
+        inputs = Path(temporary) / "mods.txt"
+        inputs.write_text("\n".join(str(path) for path in paths) + "\n", encoding="utf-8")
+        command = [str(executable), "-f", "BC1", "-af", "BC7", "-on", "-vf", "-fs", "-ss", "Textures", "-t", "-p", str(inputs)]
+        progress(f"Optimizing textures in {len(paths)} enabled live mod folders with todds (CPU). Original PNGs are retained.")
+        progress("Existing current DDS files are skipped. The first conversion can take a while; progress appears below.")
+        with log_path.open("w", encoding="utf-8") as log:
+            log.write("Enabled live mod folders:\n" + "\n".join(str(path) for path in paths) + "\n\n")
+            kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", **kwargs)
+            assert process.stdout is not None
+            last_report = 0.0
+            for line in process.stdout:
+                log.write(line)
+                message = line.strip()
+                if message and (time.monotonic() - last_report > 1 or "error" in message.lower()):
+                    progress("todds: " + message)
+                    last_report = time.monotonic()
+            exit_code = process.wait()
+    if exit_code:
+        raise RuntimeError(f"Texture optimization failed (exit {exit_code}). See {log_path}")
+    progress(f"Texture optimization complete. Log: {log_path}")
+    return log_path
+
+
 def steamcmd_update_target_ids(result: ScanResult) -> list[str]:
     return [item_id for item_id in result.required_order if item_id in result.local_steamcmd_ids]
 
@@ -2586,7 +2749,7 @@ def build_vanilla_sorted_active_list(result: ScanResult) -> SortResult:
         ],
         *[
             item_id
-            for item_id in sorted(result.always_enabled_ids, key=int)
+            for item_id in sorted(result.always_enabled_ids, key=mod_item_sort_key)
             if item_id in result.installed_ids and item_id not in result.ready_ids
         ],
     ]
@@ -2674,7 +2837,7 @@ def sort_cache_key(result: ScanResult) -> str:
         ],
         *[
             item_id
-            for item_id in sorted(result.always_enabled_ids, key=int)
+            for item_id in sorted(result.always_enabled_ids, key=mod_item_sort_key)
             if item_id in result.installed_ids and item_id not in result.ready_ids
         ],
     ]
@@ -2701,8 +2864,8 @@ def sort_cache_key(result: ScanResult) -> str:
     payload = {
         "required_order": result.required_order,
         "active_item_ids": active_item_ids,
-        "always_enabled_ids": sorted(result.always_enabled_ids, key=int),
-        "disabled_ids": sorted(result.disabled_ids, key=int),
+        "always_enabled_ids": sorted(result.always_enabled_ids, key=mod_item_sort_key),
+        "disabled_ids": sorted(result.disabled_ids, key=mod_item_sort_key),
         "about_signatures": about_signatures,
         "config_digest": config_digest,
     }
@@ -2795,6 +2958,38 @@ def write_mods_config(
     if sort_result.broken_edges:
         progress(f"Sort note: broke {sort_result.broken_edges} conflicting/cyclic rules to finish the order.")
     return result.mods_config_path
+
+
+def prepare_live_launch_config(result: ScanResult, progress) -> SortResult:
+    """Apply choices and verify the on-disk profile before any live Steam launch."""
+    if rimworld_is_running():
+        raise RuntimeError("Close RimWorld before applying the live mod profile.")
+    unavailable = result.always_enabled_ids - result.installed_ids
+    invalid = {
+        item_id for item_id in result.always_enabled_ids
+        if not result.installed_package_ids.get(item_id)
+        or item_id in result.unregistered_ids
+    }
+    if unavailable or invalid:
+        raise RuntimeError(
+            "Cannot launch: Always Enabled mod(s) are missing or not loadable: "
+            + ", ".join(sorted(unavailable | invalid))
+        )
+    if result.missing_ids or result.unregistered_ids:
+        raise RuntimeError("Cannot launch: required mods are missing or not loadable. Use PLAY NOW to install them.")
+    sort_result = get_or_build_sort_result(result, progress)
+    pinned_packages = {
+        result.installed_package_ids[item_id].lower()
+        for item_id in result.always_enabled_ids
+    }
+    if not pinned_packages <= set(sort_result.package_ids):
+        raise RuntimeError("Cannot launch: the prepared load order omitted an Always Enabled mod.")
+    write_mods_config(result, progress, sort_result)
+    active = set(existing_active_mods(result.mods_config_path))
+    if active != set(sort_result.package_ids) or not pinned_packages <= active:
+        raise RuntimeError("Cannot launch: ModsConfig.xml does not match the prepared active mod list.")
+    progress(f"Verified live ModsConfig.xml: {len(active)} active mods, including {len(pinned_packages)} Always Enabled mods.")
+    return sort_result
 
 
 class SaveSelectionDialog(simpledialog.Dialog):
@@ -3087,6 +3282,7 @@ class ProgressorApp(tk.Tk):
         )
         self.exclude_cosmetics = BooleanVar(value=saved_settings.get("exclude_cosmetics") is True)
         self.current_result: ScanResult | None = None
+        self._busy = False
         self.current_sort_result: SortResult | None = None
         self.current_rows: list[tuple[str, str, str, str | None, QuarantinedMod | None]] = []
         self.load_order_rows: list[tuple[str, str, str, str | None, QuarantinedMod | None]] = []
@@ -3123,6 +3319,7 @@ class ProgressorApp(tk.Tk):
         self._build_ui()
         self.update_quick_frozen_button()
         self.protocol("WM_DELETE_WINDOW", self.close_app)
+        self.after(150, self.load_installed_on_startup)
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self)
@@ -3269,6 +3466,9 @@ class ProgressorApp(tk.Tk):
         ttk.Button(toolbar, text="Scan Ferny's Pack", command=self.start_scan).pack(side="left")
         ttk.Button(toolbar, text="Download Missing", command=self.download_missing).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Check Mod Updates", command=self.update_steamcmd_mods).pack(side="left", padx=6)
+        self.optimize_button = ttk.Button(toolbar, text="Optimize Textures", command=self.optimize_textures)
+        self.optimize_button.pack(side="left", padx=6)
+        HoverTooltip(self.optimize_button, lambda: "CPU compression for the live pack + Always Enabled mods; original PNGs retained.")
         ttk.Button(toolbar, text="Always Enable Selected", command=self.always_enable_selected).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Reset Selected", command=self.reset_selected).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Always Disable Selected", command=self.disable_selected).pack(side="left", padx=6)
@@ -3847,6 +4047,8 @@ class ProgressorApp(tk.Tk):
         threading.Thread(target=target, daemon=True).start()
 
     def set_busy(self, message: str) -> None:
+        self._busy = True
+        self.optimize_button.configure(state="disabled")
         self.play_button.configure(state="disabled", text=message.upper())
         self.play_button.start_indeterminate()
         if self.quick_frozen_button is not None:
@@ -3872,12 +4074,17 @@ class ProgressorApp(tk.Tk):
         self.after(0, apply)
 
     def clear_busy(self) -> None:
+        self._busy = False
+        self.optimize_button.configure(state="normal")
         self.play_button.reset()
         self.busy_message.set("")
         self.play_button.configure(state="normal", text="PLAY NOW")
         self.update_quick_frozen_button()
 
     def run_busy_worker(self, message: str, target) -> None:
+        if getattr(self, "_busy", False):
+            self.progress("Wait for the current launcher operation to finish.")
+            return
         self.set_busy(message)
 
         def wrapped() -> None:
@@ -3946,10 +4153,16 @@ class ProgressorApp(tk.Tk):
                 local_targets,
                 steamcmd_acf_path(resolved_steamcmd.parent),
                 remote_times,
-                fallback_manifest_paths=[steam_client_acf_path(result.workshop_path)],
+                refresh_untracked=True,
             )
         else:
             local_outdated, local_unknown = [], []
+        reused = reuse_current_workshop_copies(result, local_outdated, remote_times, self.progress)
+        if reused:
+            result = self.scan_paths_with_required(required_snapshot, self.progress)
+            local_targets = steamcmd_update_target_ids(result)
+            workshop_targets = steam_workshop_update_target_ids(result)
+            local_outdated = [item_id for item_id in local_outdated if item_id not in reused]
         workshop_outdated, workshop_unknown = workshop_outdated_ids(
             workshop_targets,
             steam_client_acf_path(result.workshop_path),
@@ -3957,7 +4170,9 @@ class ProgressorApp(tk.Tk):
         )
 
         if local_outdated:
-            self.progress(f"Updating {len(local_outdated)} local SteamCMD mod(s) before launch...")
+            recorded_local_times = parse_steamcmd_update_times(resolved_steamcmd.parent)
+            unverified = sum(item_id not in recorded_local_times for item_id in local_outdated)
+            self.progress(f"SteamCMD refresh: {len(local_outdated) - unverified} known updates and {unverified} existing local mod(s) without a download record. These are not new pack additions.")
             run_steamcmd_downloads(
                 result,
                 self.progress,
@@ -3973,43 +4188,13 @@ class ProgressorApp(tk.Tk):
         unknown_count = len(set(local_unknown) | set(workshop_unknown))
         if unknown_count:
             self.progress(f"{unknown_count} installed mod(s) could not be version-compared.")
-        if not local_outdated and not workshop_outdated:
+        if not local_outdated and not workshop_outdated and not unknown_count:
             self.progress("Pre-launch update check found no updates.")
         return result
 
     def advanced_launch(self) -> None:
-        auto_update = self.auto_update_on_launch.get()
-        if not auto_update:
-            webbrowser.open(STEAM_RUN_RIMWORLD)
-            return
-        self.auto_detect_invalid_paths()
-
-        def worker() -> None:
-            old_env = os.environ.get("STEAMCMD")
-            try:
-                steamcmd = self.steamcmd_path.get().strip()
-                if steamcmd:
-                    os.environ["STEAMCMD"] = steamcmd
-                required_snapshot = fetch_required_items(self.progress)
-                result = self.scan_paths_with_required(required_snapshot, self.progress)
-                result = self.apply_updates_before_launch(result, required_snapshot)
-                self.current_result = result
-                sort_result = get_or_build_sort_result(result, self.progress)
-                self.current_sort_result = sort_result
-                self.after(0, lambda: self.render_result(result, sort_result))
-                self.progress("Launching RimWorld through Steam...")
-                webbrowser.open(STEAM_RUN_RIMWORLD)
-            except (RuntimeError, OSError, urllib.error.URLError) as exc:
-                self.progress(f"Launch update failed: {exc}")
-                error = str(exc)
-                self.after(0, lambda: messagebox.showerror("Launch update failed", error))
-            finally:
-                if old_env is None:
-                    os.environ.pop("STEAMCMD", None)
-                else:
-                    os.environ["STEAMCMD"] = old_env
-
-        self.run_busy_worker("Checking updates before launch...", worker)
+        # Both live launch buttons must apply pins, even with auto-update off.
+        self.play_now()
 
     def play_now(self) -> None:
         if rimworld_is_running():
@@ -4057,8 +4242,7 @@ class ProgressorApp(tk.Tk):
                         f"{len(result.unregistered_ids)} mods are still present only as non-loadable Workshop folders. "
                         "Run the SteamCMD download step again, or check that Local Mods points to RimWorld's Mods folder."
                     )
-                sort_result = get_or_build_sort_result(result, self.progress)
-                write_mods_config(result, self.progress, sort_result)
+                sort_result = prepare_live_launch_config(result, self.progress)
                 self.current_result = result
                 self.current_sort_result = sort_result
                 self.after(0, lambda: self.render_result(result, sort_result))
@@ -4076,6 +4260,30 @@ class ProgressorApp(tk.Tk):
 
         self.run_busy_worker("Preparing live setup...", worker)
 
+    def optimize_textures(self) -> None:
+        if rimworld_is_running():
+            messagebox.showinfo("Close RimWorld", "Close RimWorld before optimizing textures, then press Optimize Textures again.")
+            return
+        self.auto_detect_invalid_paths()
+        # Snapshot Tk values on the UI thread. No network refresh or game launch.
+        required = self.current_result.required if self.current_result else load_collection_cache()
+        workshop = Path(self.workshop_path.get())
+        local = Path(self.local_mods_path.get())
+        config = Path(self.mods_config_path.get())
+        exclude_cosmetics = self.exclude_cosmetics.get()
+        def worker() -> None:
+            try:
+                if not required:
+                    raise RuntimeError("Scan Ferny's Pack before optimizing textures.")
+                result = scan_with_required(required, workshop, local, config, self.progress, exclude_cosmetics=exclude_cosmetics)
+                log_path = run_texture_optimization(result, self.progress)
+                self.after(0, lambda: messagebox.showinfo("Textures optimized", "Texture optimization finished. You can press PLAY NOW when ready.\n\nLog: " + str(log_path)))
+            except (RuntimeError, OSError) as exc:
+                error = str(exc)
+                self.progress("Texture optimization failed: " + error)
+                self.after(0, lambda: messagebox.showerror("Texture optimization failed", error))
+        self.run_busy_worker("Optimizing textures...", worker)
+
     def start_scan(self) -> None:
         self.tree.delete(*self.tree.get_children())
         self.progress("Starting scan...")
@@ -4092,6 +4300,27 @@ class ProgressorApp(tk.Tk):
 
         self.run_busy_worker("Scanning pack...", worker)
 
+    def load_installed_on_startup(self) -> None:
+        required = load_collection_cache()
+        if not required:
+            self.progress("Use Scan Ferny's Pack to load the mod list.")
+            return
+        workshop = Path(self.workshop_path.get())
+        local_mods = Path(self.local_mods_path.get())
+        config = Path(self.mods_config_path.get())
+        exclude_cosmetics = self.exclude_cosmetics.get()
+
+        def worker() -> None:
+            try:
+                result = scan_with_required(required, workshop, local_mods, config, self.progress, exclude_cosmetics=exclude_cosmetics)
+                self.current_result = result
+                self.after(0, lambda: self.render_result(result))
+                self.progress("Installed mods loaded using the saved pack list. Scan Ferny's Pack refreshes the online list.")
+            except (RuntimeError, OSError) as exc:
+                self.progress(f"Could not load installed mods: {exc}")
+
+        self.run_busy_worker("Checking installed mods...", worker)
+
     def build_load_order_rows(
         self,
         result: ScanResult,
@@ -4106,7 +4335,7 @@ class ProgressorApp(tk.Tk):
             ],
             *[
                 item_id
-                for item_id in sorted(result.always_enabled_ids, key=int)
+                for item_id in sorted(result.always_enabled_ids, key=mod_item_sort_key)
                 if item_id in result.installed_ids and item_id not in result.ready_ids
             ],
         ]
@@ -4137,7 +4366,7 @@ class ProgressorApp(tk.Tk):
                     title = metadata.name
                 else:
                     title = package_id
-                if item_id in result.local_steamcmd_ids:
+                if item_id in result.local_steamcmd_ids or not item_id.isdigit():
                     source = "Local"
                 elif item:
                     source = item.collection
@@ -4194,13 +4423,12 @@ class ProgressorApp(tk.Tk):
                 state = "Always Disabled"
             else:
                 state = "Disabled"
-            source = "Local" if item_id in result.local_steamcmd_ids else "Workshop"
-            package_id = result.installed_package_ids.get(item_id, "")
-            label = f"{item_id}  {package_id}" if package_id else item_id
+            source = "Local" if item_id in result.local_steamcmd_ids or not item_id.isdigit() else "Workshop"
+            label = extra_mod_label(result, item_id)
             rows.append((state, source, label, item_id, None))
         for item_id in result.ready_ids:
             item = result.required[item_id]
-            source = "Local" if item_id in result.local_steamcmd_ids else item.collection
+            source = "Local" if item_id in result.local_steamcmd_ids or not item_id.isdigit() else item.collection
             if item_id in result.always_enabled_ids:
                 state = "Always Enabled"
             elif item_id in result.disabled_ids:
@@ -4664,7 +4892,7 @@ class ProgressorApp(tk.Tk):
                         local_targets,
                         steamcmd_acf_path(resolved_steamcmd.parent),
                         remote_times,
-                        fallback_manifest_paths=[steam_client_acf_path(result.workshop_path)],
+                        refresh_untracked=True,
                     )
                 else:
                     local_outdated, local_unknown = [], []
@@ -4697,7 +4925,7 @@ class ProgressorApp(tk.Tk):
                     if len(local_outdated) > 12:
                         preview += f"\n...and {len(local_outdated) - 12} more"
                     prompt = (
-                        f"Steam reports {len(local_outdated)} newer SteamCMD mod(s).\n\n"
+                        f"{len(local_outdated)} local SteamCMD mod(s) are outdated or have no local update record.\n\n"
                         f"{preview}\n\nUpdate these local mods now?"
                     )
                     local_unavailable = set(local_unknown) & unavailable_ids
@@ -4707,12 +4935,15 @@ class ProgressorApp(tk.Tk):
                     if local_unresolved:
                         prompt += f"\n{local_unresolved} SteamCMD mod(s) could not be compared."
                     if ask_yes_no("Update SteamCMD mods", prompt):
-                        run_steamcmd_downloads(
-                            result,
-                            self.progress,
-                            targets=local_outdated,
-                            progress_count=self.update_busy_download_progress,
-                        )
+                        reused = reuse_current_workshop_copies(result, local_outdated, remote_times, self.progress)
+                        remaining = [item_id for item_id in local_outdated if item_id not in reused]
+                        if remaining:
+                            run_steamcmd_downloads(
+                                result,
+                                self.progress,
+                                targets=remaining,
+                                progress_count=self.update_busy_download_progress,
+                            )
                         updated_local = True
                     else:
                         self.progress("SteamCMD updates skipped.")
@@ -4738,6 +4969,11 @@ class ProgressorApp(tk.Tk):
                     if workshop_unresolved:
                         prompt += f"\n{workshop_unresolved} Workshop mod(s) could not be compared."
                     if ask_yes_no("Steam Workshop updates", prompt):
+                        fresh_result = self.scan_paths_with_required(result.required, self.progress)
+                        sort_result = prepare_live_launch_config(fresh_result, self.progress)
+                        self.current_result = fresh_result
+                        self.current_sort_result = sort_result
+                        self.after(0, lambda: self.render_result(fresh_result, sort_result))
                         self.progress("Launching RimWorld through Steam so subscribed Workshop updates are applied...")
                         webbrowser.open(STEAM_RUN_RIMWORLD)
                         launched_for_workshop = True

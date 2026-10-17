@@ -1,0 +1,19 @@
+name: Launcher checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run launcher regression checks
+        shell: pwsh
+        run: |
+          Get-ChildItem tests/*_smoke.py | ForEach-Object {
+            python $_.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

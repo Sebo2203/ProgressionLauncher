@@ -2,9 +2,9 @@
 
 Windows and macOS helper for launching Ferny's Progression RimWorld modpack.
 
-[**Download Progression Launcher v0.4.3 for Windows**](https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.3/ProgressionLauncher-v0.4.3.exe)
+[**Download Progression Launcher v0.4.4 for Windows**](https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.4/ProgressionLauncher-v0.4.4.exe)
 
-[**Download Progression Launcher v0.4.3 macOS Candidate**](https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.3-macos-test/ProgressionLauncher-macOS-v0.4.3-candidate.1.zip)
+[**Download for macOS (Apple Silicon or Intel, test builds)**](https://github.com/Sebo2203/ProgressionLauncher/releases/tag/v0.4.4-macos-test)
 
 macOS test builds are produced by the `Build macOS` GitHub Actions workflow as an artifact named `Progression-Launcher-macOS`. See [MAC_TESTER.md](MAC_TESTER.md) for tester instructions.
 
@@ -66,7 +66,7 @@ No third-party Python packages are required.
 - checks whether mods are loadable from Steam Workshop or the local `Mods` folder
 - downloads missing or non-loadable items through SteamCMD into local `Mods`
 - leaves extra installed mods disabled
-- keeps user-selected `Always Enabled` mods active
+- keeps user-selected `Always Enabled` mods active, including named local addons
 - activates and sorts using RimWorld-style dependency, `loadAfter`, and `loadBefore` rules
 - launches RimWorld through Steam
 
@@ -75,6 +75,15 @@ Use `Show Advanced Options` for troubleshooting, manual paths, selecting always-
 The mod table includes a live approximate-name search. Typing filters non-matching rows, selects the strongest match, and scrolls it into view. It also works in the `Active Load Order` view.
 
 When frozen profiles exist, the selected profile is also available directly beneath `PLAY NOW`. The launcher remembers that selection between restarts. Hover over the adjacent `?` for a summary of the difference between live and frozen play.
+
+## What is new in v0.4.4
+
+- Named local mods can be pinned, sorted, and included in frozen profiles.
+- Both launch buttons now apply your selected mods consistently.
+- Stale local copies use their own update records; current Steam copies can be reused instead of downloaded again. Replaced local copies are backed up.
+- **Optimize Textures** prepares DDS textures for the selected live pack and pinned mods. Close RimWorld first. Original PNGs and frozen profiles are preserved, and current DDS files are skipped.
+
+Texture optimization uses the bundled [todds 0.4.1 encoder](https://github.com/todds-encoder/todds/tree/0.4.1), under the Mozilla Public License 2.0. License and source information are in `todds/`.
 
 ## Paths
 
@@ -189,7 +198,7 @@ build_exe.bat
 The built app appears at:
 
 ```text
-outputs\dist\Progression Launcher.exe
+dist\ProgressionLauncher-v0.4.4.exe
 ```
 
 To build a macOS app bundle on a Mac:

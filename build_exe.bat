@@ -2,9 +2,9 @@
 setlocal
 cd /d "%~dp0"
 
-set BUILD_ROOT=..\..\work\ferny_progressor_build
+set BUILD_ROOT=.build\ferny_progressor_build
 set VENV=%BUILD_ROOT%\.venv
-set DIST=..\dist
+set DIST=dist
 set APP_DIR=%CD%
 
 if not exist "%VENV%\Scripts\python.exe" (
@@ -20,14 +20,15 @@ if not exist "%DIST%" mkdir "%DIST%"
   --clean ^
   --onefile ^
   --windowed ^
-  --name "Progression Launcher" ^
+  --name "ProgressionLauncher-v0.4.4" ^
   --add-data "%APP_DIR%\progression_logo.png;." ^
   --add-data "%APP_DIR%\collection_cache.json;." ^
+  --add-data "%APP_DIR%\todds;todds" ^
   --distpath "%DIST%" ^
   --workpath "%BUILD_ROOT%\pyinstaller-work" ^
   --specpath "%BUILD_ROOT%" ^
   progressor.py
 
 echo.
-echo Built: %DIST%\Progression Launcher.exe
+echo Built: %DIST%\ProgressionLauncher-v0.4.4.exe
 pause

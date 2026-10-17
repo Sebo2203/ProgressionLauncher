@@ -4,76 +4,72 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to attach the macOS test build to"
+        description: Release tag for macOS test builds
         required: true
-        default: "v0.4.3-macos-test"
-      release_name:
-        description: "Release title"
-        required: true
-        default: "Progression Launcher v0.4.3 macOS Test"
+        default: v0.4.4-macos-test
   push:
-    branches:
-      - master
+    branches: [master]
     paths:
-      - "progressor.py"
-      - "progression_logo.png"
-      - "collection_cache.json"
-      - "build_macos.sh"
-      - "tests/macos_compat_smoke.py"
-      - "MAC_TESTER.md"
-      - ".github/workflows/build-macos.yml"
+      - progressor.py
+      - progression_logo.png
+      - collection_cache.json
+      - build_macos.sh
+      - tests/**
+      - todds/**
+      - .github/workflows/build-macos.yml
 
 permissions:
   contents: write
 
 jobs:
   build-macos:
-    name: Build macOS app
-    runs-on: macos-latest
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
     env:
-      RELEASE_TAG: ${{ github.event.inputs.release_tag || 'v0.4.3-macos-test' }}
-      RELEASE_NAME: ${{ github.event.inputs.release_name || 'Progression Launcher v0.4.3 macOS Test' }}
-      MAC_ZIP: ProgressionLauncher-macOS-v0.4.3-candidate.1.zip
-
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || 'v0.4.4-macos-test' }}
+      MAC_ZIP: ProgressionLauncher-macOS-v0.4.4-${{ matrix.arch }}-test.zip
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - name: Run macOS compatibility smoke test
-        run: python tests/macos_compat_smoke.py
-
-      - name: Build app bundle
+          python-version: '3.12'
+      - name: Check launcher behavior
         run: |
-          chmod +x build_macos.sh
-          ./build_macos.sh
-
-      - name: Ad-hoc sign app bundle
-        run: codesign --force --deep --sign - dist/Progression\ Launcher.app
-
-      - name: Package app bundle
+          python tests/macos_compat_smoke.py
+          python tests/local_update_smoke.py
+          python tests/custom_local_mod_smoke.py
+          python tests/workshop_reuse_smoke.py
+          python tests/live_launch_smoke.py
+      - name: Build native app and encoder
+        run: bash build_macos.sh
+      - name: Check native texture conversion
+        run: python tests/texture_optimizer_smoke.py
+      - name: Sign and package app
         run: |
+          find "dist/Progression Launcher.app" -type f -path '*/todds/todds' -exec codesign --force --sign - {} \;
+          codesign --force --deep --sign - "dist/Progression Launcher.app"
+          codesign --verify --deep --strict "dist/Progression Launcher.app"
           cd dist
           ditto -c -k --sequesterRsrc --keepParent "Progression Launcher.app" "$MAC_ZIP"
           shasum -a 256 "$MAC_ZIP" > "$MAC_ZIP.sha256"
-
-      - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: Progression-Launcher-macOS
+          name: Progression-Launcher-macOS-${{ matrix.arch }}
           path: |
             dist/${{ env.MAC_ZIP }}
             dist/${{ env.MAC_ZIP }}.sha256
-
-      - name: Publish macOS test release asset
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: ${{ env.RELEASE_NAME }}
+          name: Progression Launcher v0.4.4 macOS Test
           prerelease: true
           make_latest: false
           overwrite_files: true
