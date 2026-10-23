@@ -2,11 +2,6 @@ name: Build macOS
 
 on:
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: Release tag for macOS test builds
-        required: true
-        default: v0.4.4-macos-test
   push:
     branches: [master]
     paths:
@@ -19,7 +14,7 @@ on:
       - .github/workflows/build-macos.yml
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-macos:
@@ -34,8 +29,7 @@ jobs:
             arch: x86_64
     runs-on: ${{ matrix.os }}
     env:
-      RELEASE_TAG: ${{ github.event.inputs.release_tag || 'v0.4.4-macos-test' }}
-      MAC_ZIP: ProgressionLauncher-macOS-v0.4.4-${{ matrix.arch }}-test.zip
+      MAC_ZIP: ProgressionLauncher-macOS-v0.4.5-${{ matrix.arch }}-test.zip
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -48,6 +42,10 @@ jobs:
           python tests/custom_local_mod_smoke.py
           python tests/workshop_reuse_smoke.py
           python tests/live_launch_smoke.py
+          python tests/merged_mod_smoke.py
+          python tests/dlc_filter_smoke.py
+          python tests/linux_compat_smoke.py
+          python tests/mod_library_ui_smoke.py
       - name: Build native app and encoder
         run: bash build_macos.sh
       - name: Check native texture conversion
@@ -64,16 +62,5 @@ jobs:
         with:
           name: Progression-Launcher-macOS-${{ matrix.arch }}
           path: |
-            dist/${{ env.MAC_ZIP }}
-            dist/${{ env.MAC_ZIP }}.sha256
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: Progression Launcher v0.4.4 macOS Test
-          prerelease: true
-          make_latest: false
-          overwrite_files: true
-          body_path: MAC_TESTER.md
-          files: |
             dist/${{ env.MAC_ZIP }}
             dist/${{ env.MAC_ZIP }}.sha256

@@ -1,0 +1,43 @@
+name: Build Linux
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - progressor.py
+      - build_linux.sh
+      - tests/**
+      - todds/**
+      - progression_logo.png
+      - collection_cache.json
+      - .github/workflows/build-linux.yml
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build and display dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb libegl1 libopengl0
+      - name: Build launcher and native encoder
+        run: bash build_linux.sh
+      - name: Check launcher behavior and UI
+        run: xvfb-run -a python tests/run_smoke.py
+      - name: Check packaged startup
+        run: |
+          set +e
+          timeout 15s xvfb-run -a dist/ProgressionLauncher/ProgressionLauncher > packaged-startup.log 2>&1
+          result=$?
+          cat packaged-startup.log
+          test "$result" -eq 124
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Progression-Launcher-Linux-x86_64
+          path: |
+            dist/ProgressionLauncher-Linux-*.tar.gz
+            dist/ProgressionLauncher-Linux-*.sha256
+            packaged-startup.log

@@ -1,27 +1,31 @@
 # Progression Launcher
 
-Windows and macOS helper for launching Ferny's Progression RimWorld modpack.
+Windows, macOS and Linux helper for launching Ferny's Progression RimWorld modpack.
 
-[**Download Progression Launcher v0.4.4 for Windows**](https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.4/ProgressionLauncher-v0.4.4.exe)
+[**Download Progression Launcher v0.4.5 for Windows**](https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.5/ProgressionLauncher-v0.4.5.exe)
 
-[**Download for macOS (Apple Silicon or Intel, test builds)**](https://github.com/Sebo2203/ProgressionLauncher/releases/tag/v0.4.4-macos-test)
+[**Download for macOS (Apple Silicon or Intel, test builds)**](https://github.com/Sebo2203/ProgressionLauncher/releases/tag/v0.4.5-macos-test)
 
-macOS test builds are produced by the `Build macOS` GitHub Actions workflow as an artifact named `Progression-Launcher-macOS`. See [MAC_TESTER.md](MAC_TESTER.md) for tester instructions.
+[**Download for Linux x86_64 (experimental)**](https://github.com/Sebo2203/ProgressionLauncher/releases/tag/v0.4.5-linux-test)
+
+The [download page](https://sebo2203.github.io/ProgressionLauncher/) lists all three platforms. Mac and Linux packages are built and checked on native GitHub runners before publication. See [MAC_TESTER.md](MAC_TESTER.md) and [LINUX_TESTER.md](LINUX_TESTER.md) for tester instructions.
 
 Progression Launcher fetches Ferny's live Steam Workshop collections, compares them against your Steam Workshop folder and RimWorld local `Mods` folder, downloads missing items through SteamCMD, writes a backed-up `ModsConfig.xml`, and launches RimWorld through Steam.
 
 ## Requirements
 
-- Windows 10/11 or macOS
+- Windows 10/11 x64, macOS (Intel or Apple Silicon), or Linux x86_64
 - RimWorld installed through Steam
 - An internet connection
 - [SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD)
 
-SteamCMD is required for downloading mods that the Steam client has not made loadable. If it is missing when a SteamCMD operation begins, Progression Launcher downloads the official Windows or macOS package directly from Valve and configures it automatically. You can also install it ahead of time with `Show Advanced Options` > `Install SteamCMD`.
+SteamCMD is required for downloading mods that the Steam client has not made loadable. If it is missing when a SteamCMD operation begins, Progression Launcher downloads the matching official Windows, macOS or Linux package directly from Valve and configures it automatically. You can also install it ahead of time with `Show Advanced Options` > `Locations` > `Install SteamCMD`.
+
+Windows is verified locally. Mac and Linux builds have automated platform checks; real game-launch testing is still needed before those platforms can be considered stable. Linux support remains experimental. SteamOS uses the Linux build in desktop mode; controller and gaming-mode integration have not been tested.
 
 You can also install SteamCMD manually:
 
-1. Download Valve's official Windows [`steamcmd.zip`](https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip) or macOS [`steamcmd_osx.tar.gz`](https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz).
+1. Download Valve's official Windows [`steamcmd.zip`](https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip), macOS [`steamcmd_osx.tar.gz`](https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz), or Linux [`steamcmd_linux.tar.gz`](https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz).
 2. Extract it into a permanent folder such as `C:\SteamCMD` on Windows or `~/SteamCMD` on macOS.
 3. Press `Auto Detect Paths`, or use the SteamCMD `Browse` button and select the extracted `steamcmd.exe` or `steamcmd.sh`.
 
@@ -50,13 +54,15 @@ Double-click:
 run_progressor.bat
 ```
 
-On macOS or from source, run:
+On macOS, Linux or from source, run:
 
 ```sh
 python progressor.py
 ```
 
 No third-party Python packages are required.
+
+Linux source installs also need Tk (`python3-tk` on Debian/Ubuntu). SteamCMD requires the distribution's 32-bit runtime libraries, commonly `lib32gcc-s1` and `lib32stdc++6` on Debian/Ubuntu. The launcher installs SteamCMD in your user data folder; it does not install system packages or require root. Linux folder actions use `xdg-open`. Steam libraries, XDG paths and common Flatpak Steam locations are detected, but sandbox permissions can still require manual paths.
 
 ## Player Flow
 
@@ -72,16 +78,29 @@ No third-party Python packages are required.
 
 Use `Show Advanced Options` for troubleshooting, manual paths, selecting always-enabled mods, frozen profiles, or running individual steps manually.
 
-The mod table includes a live approximate-name search. Typing filters non-matching rows, selects the strongest match, and scrolls it into view. It also works in the `Active Load Order` view.
+Under `Skip DLC`, check any DLC you want to leave out: Royalty, Ideology, Biotech, Anomaly, or Odyssey. The launcher remembers your choices and excludes those DLCs, mods that require them, and mods that depend on an excluded mod. Excluded mods appear as `DLC excluded` in the table. Saved pins return when you clear the filter; existing frozen profiles keep their original contents.
+
+Known and previously read DLC requirements are skipped before downloading. A mod whose requirements are not known yet may need to download first, then is checked again before activation. The launcher also includes corrections for ten Anomaly and Odyssey mods with missing declarations.
+
+The mod library shows the next launch's active load order beside inactive and missing mods. Select a mod to inspect its status, package ID, requirements, and folder. Use `Enable / pin`, `Disable`, or `Use pack default` to manage your overrides, then `Apply & sort` to save without launching. The active list stays in dependency order; click an inactive-list heading to sort by name, status, or pack.
+
+The curved-arrow button beside `Use pack default` undoes your last manual pin, disable or reset action (`Ctrl+Z`, or `âŒ˜Z` on Mac). A multi-mod change is undone together. Undo history survives restarts and preserves unrelated choices. It restores your saved overrides; `Apply & sort` writes the resulting load order. DLC and Cosmetics filters still apply.
+
+`Show activity` records each changed mod's name, ID and previous/new state, plus settings changes and operations such as scans, downloads and launches. Recent activity is restored when the launcher reopens. Logs and the last 500 manual mod actions are saved locally under the launcher's data folder in `activity/`; routine search and selection changes are omitted. Undo does not reverse downloads, game launches, profile deletion or applied game configuration.
+
+Search both lists by name, Workshop ID, or package ID (`Ctrl+F`; `Escape` clears). Exact matches take priority, with approximate-name matching when needed. `Needs attention` shows missing or non-loadable mods. Filtering keeps your selection when it still matches. The activity log is available through `Show activity`; paths and less-used controls stay under `Show Advanced Options` > `Locations`.
 
 When frozen profiles exist, the selected profile is also available directly beneath `PLAY NOW`. The launcher remembers that selection between restarts. Hover over the adjacent `?` for a summary of the difference between live and frozen play.
 
-## What is new in v0.4.4
+## What is new in v0.4.5
 
-- Named local mods can be pinned, sorted, and included in frozen profiles.
-- Both launch buttons now apply your selected mods consistently.
-- Stale local copies use their own update records; current Steam copies can be reused instead of downloaded again. Replaced local copies are backed up.
-- **Optimize Textures** prepares DDS textures for the selected live pack and pinned mods. Close RimWorld first. Original PNGs and frozen profiles are preserved, and current DDS files are skipped.
+- Active and inactive mod lists, clearer filters, and a selected-mod details panel.
+- Saved DLC exclusions that also skip dependent mods.
+- A visual undo button and named activity logs that survive restarts.
+- Recognition of Aspen content included in ReGrowth 2, plus clearer errors for unavailable Workshop items.
+- Experimental Linux support and macOS compatibility improvements.
+
+See [CHANGELOG.md](CHANGELOG.md) for release history. Existing frozen profiles are unchanged.
 
 Texture optimization uses the bundled [todds 0.4.1 encoder](https://github.com/todds-encoder/todds/tree/0.4.1), under the Mozilla Public License 2.0. License and source information are in `todds/`.
 
@@ -164,7 +183,7 @@ The first shared snapshot can still consume many gigabytes because it must prese
 
 ## SteamCMD Note
 
-SteamCMD mode is supported by making SteamCMD download directly into RimWorld's local `Mods` folder through a junction on Windows or a symlink on macOS:
+SteamCMD mode is supported by making SteamCMD download directly into RimWorld's local `Mods` folder through a junction on Windows or a symlink on macOS/Linux:
 
 ```text
 <SteamCMD>\steamapps\workshop\content\294100
@@ -198,7 +217,7 @@ build_exe.bat
 The built app appears at:
 
 ```text
-dist\ProgressionLauncher-v0.4.4.exe
+dist\ProgressionLauncher-v0.4.5.exe
 ```
 
 To build a macOS app bundle on a Mac:
@@ -220,3 +239,13 @@ python tests/macos_compat_smoke.py
 ```
 
 This simulates macOS path detection, SteamCMD extraction, SteamCMD symlink setup, frozen profile creation, and frozen launch command construction. A real Mac is still required to build and launch the final `.app`.
+
+To build the Linux x86_64 bundle on Linux:
+
+```sh
+bash build_linux.sh
+```
+
+The build downloads a checksum-verified native texture encoder and creates `dist/ProgressionLauncher-Linux-v<version>-x86_64-test.tar.gz`. Extract the archive and run `ProgressionLauncher/ProgressionLauncher`. Build on Ubuntu 22.04 for the baseline used by the Linux workflow; other distributions still need validation.
+
+Run all regression scripts with `python tests/run_smoke.py`. On headless Linux, use `xvfb-run -a python tests/run_smoke.py`. The non-Windows texture check needs its native encoder (`python tests/fetch_native_encoder.py`). `tests/linux_compat_smoke.py` can also simulate Linux-specific behavior from Windows; that does not replace native testing. GitHub checks now target Windows, both Mac architectures and Linux.

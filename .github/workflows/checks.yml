@@ -1,19 +1,34 @@
 name: Launcher checks
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  windows:
-    runs-on: windows-latest
+  platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15, macos-15-intel, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Run launcher regression checks
-        shell: pwsh
+      - name: Install Linux display dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb libegl1 libopengl0
+      - name: Install native encoder
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          Get-ChildItem tests/*_smoke.py | ForEach-Object {
-            python $_.FullName
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+          python tests/fetch_native_encoder.py
+      - name: Run launcher regression checks
+        if: runner.os != 'Linux'
+        run: python tests/run_smoke.py
+      - name: Run Linux regression and UI checks
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python tests/run_smoke.py

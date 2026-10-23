@@ -34,7 +34,10 @@ with tempfile.TemporaryDirectory() as temp:
     write_mod(addon, 'sebas.randomworlds', 'ferny.worldbuilder', name='Progressor Random Worlds')
     write_mod(workshop / '12345', 'ferny.worldbuilder')
     (local / 'unfinished folder').mkdir()
-    game.joinpath('RimWorldWin64.exe').write_text('fixture executable', encoding='utf-8')
+    executable = game / ('Contents/MacOS/RimWorldMac' if sys.platform == 'darwin' else 'RimWorldLinux' if sys.platform == 'linux' else 'RimWorldWin64.exe')
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text('fixture executable', encoding='utf-8')
+    executable.chmod(0o755)
     game.joinpath('RimWorldMac').write_text('fixture executable', encoding='utf-8')
     config = root / 'UserData' / 'Config' / 'ModsConfig.xml'
     config.parent.mkdir(parents=True)

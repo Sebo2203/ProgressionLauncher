@@ -22,7 +22,7 @@ import urllib.request
 import webbrowser
 import xml.etree.ElementTree as ET
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import BooleanVar, filedialog, messagebox, simpledialog, ttk
 import tkinter as tk
@@ -30,11 +30,38 @@ import tkinter as tk
 
 APP_ID = "294100"
 APP_NAME = "Progression Launcher"
-APP_VERSION = "0.4.4"
+APP_VERSION = "0.4.5"
 COLLECTIONS = {
     "Core": "3521297585",
     "Content": "3521319712",
     "Cosmetics": "3637541646",
+}
+
+# Author-confirmed merger: https://steamcommunity.com/sharedfiles/filedetails/?id=2260097569
+# Keep replacements explicit; a missing Workshop item alone never authorizes skipping it.
+MERGED_WORKSHOP_ITEMS = {
+    "2545774148": ("ReGrowth 2: Aspen", "2260097569", "regrowth.botr.core"),
+}
+
+DLC_PACKAGES = {
+    "ludeon.rimworld.royalty": "Royalty",
+    "ludeon.rimworld.ideology": "Ideology",
+    "ludeon.rimworld.biotech": "Biotech",
+    "ludeon.rimworld.anomaly": "Anomaly",
+    "ludeon.rimworld.odyssey": "Odyssey",
+}
+# Missing requirements reported by the pack's users. Match IDs, never title keywords.
+DLC_REQUIREMENT_CORRECTIONS = {
+    "cf.odysseyupscaled2x": ("3535506453", "ludeon.rimworld.odyssey"),
+    "local.wtlodysseyquestfilter": ("3807578618", "ludeon.rimworld.odyssey"),
+    "as1aw.morehunterdrones": ("3532453334", "ludeon.rimworld.odyssey"),
+    "abrolo.grimstone.beasts": ("3535302121", "ludeon.rimworld.odyssey"),
+    "cf.anomalyupscaled2x": ("3538584455", "ludeon.rimworld.anomaly"),
+    "anomalypatch.1trickpwnyta": ("3242000764", "ludeon.rimworld.anomaly"),
+    "dlg.mutation.behind": ("3637525997", "ludeon.rimworld.anomaly"),
+    "ferny.impassablecontainmentstructures": ("3222738861", "ludeon.rimworld.anomaly"),
+    "dynamic.organdecayvariety": ("3238650014", "ludeon.rimworld.anomaly"),
+    "morton.retexturedarkpsychicritualstf": ("3720400596", "ludeon.rimworld.anomaly"),
 }
 
 WORKSHOP_URL = "https://steamcommunity.com/sharedfiles/filedetails/?id={id}"
@@ -45,6 +72,7 @@ STEAM_COLLECTION_URL = "steam://url/CommunityFilePage/{id}"
 STEAMCMD_DOWNLOAD_URLS = {
     "win32": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip",
     "darwin": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
+    "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
 }
 INSTANCE_MUTEX_NAME = r"Local\ProgressionLauncher.SingleInstance"
 _INSTANCE_MUTEX_HANDLE = None
@@ -74,6 +102,13 @@ def executable_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def open_folder(path: Path) -> None:
+    if sys.platform == "win32":
+        os.startfile(path)
+    else:
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
 
 
 def running_launcher_process_names() -> list[str]:
@@ -228,6 +263,9 @@ def show_single_instance_warning(existing_processes: list[str]) -> None:
 CACHE_PATH = app_data_dir() / "collection_cache.json"
 BUNDLED_CACHE_PATH = asset_path("collection_cache.json")
 ALWAYS_ENABLED_PATH = app_data_dir() / "always_enabled.json"
+ACTION_HISTORY_PATH = app_data_dir() / "activity" / "mod_changes.json"
+ACTIVITY_LOG_PATH = app_data_dir() / "activity" / "activity.log"
+_ACTIVITY_LOCK = threading.RLock()
 DISABLED_MODS_PATH = app_data_dir() / "disabled_mods.json"
 DEFAULT_FROZEN_PROFILES_PATH = app_data_dir() / "frozen_profiles"
 FROZEN_PROFILES_PATH = DEFAULT_FROZEN_PROFILES_PATH
@@ -262,6 +300,10 @@ class ScanResult:
     workshop_path: Path
     local_mods_path: Path
     mods_config_path: Path
+    merged_items: dict[str, str] = field(default_factory=dict)
+    excluded_dlcs: set[str] = field(default_factory=set)
+    dlc_exclusions: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    dlc_excluded_items: dict[str, WorkshopItem] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -280,6 +322,7 @@ class ModMetadata:
     dependencies: tuple[str, ...]
     load_after: tuple[str, ...]
     load_before: tuple[str, ...]
+    dependencies_by_version: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -323,6 +366,8 @@ def steam_root_candidates() -> list[Path]:
         home = Path.home()
         candidates = [
             home / ".steam" / "steam",
+            home / ".steam" / "root",
+            Path(os.environ.get("XDG_DATA_HOME", home / ".local" / "share")) / "Steam",
             home / ".local" / "share" / "Steam",
             home / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam",
         ]
@@ -418,7 +463,9 @@ def default_mods_config_path() -> Path:
         ]
     else:
         candidates = [
+            Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "unity3d" / "Ludeon Studios" / "RimWorld by Ludeon Studios" / "Config" / "ModsConfig.xml",
             Path.home() / ".config" / "unity3d" / "Ludeon Studios" / "RimWorld by Ludeon Studios" / "Config" / "ModsConfig.xml",
+            Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / "config" / "unity3d" / "Ludeon Studios" / "RimWorld by Ludeon Studios" / "Config" / "ModsConfig.xml",
         ]
     for candidate in candidates:
         if candidate.exists() or candidate.parent.exists():
@@ -433,6 +480,8 @@ def default_rimworld_mods_path() -> Path:
         if sys.platform == "darwin":
             candidates.extend(
                 [
+                    rimworld_root / "RimWorld.app" / "Mods",
+                    rimworld_root / "RimWorld.app" / "Contents" / "Resources" / "Mods",
                     rimworld_root / "RimWorldMac.app" / "Mods",
                     rimworld_root / "RimWorldMac.app" / "Contents" / "Resources" / "Mods",
                     rimworld_root / "Mods",
@@ -488,7 +537,8 @@ def resolved_executable_path(raw_path: str | Path | None) -> Path | None:
         return None
     candidate = Path(text)
     if candidate.is_dir():
-        candidate /= "steamcmd.sh" if sys.platform == "darwin" else "steamcmd.exe"
+        candidates = [candidate / name for name in (("steamcmd.exe",) if sys.platform == "win32" else ("steamcmd.sh", "steamcmd"))]
+        candidate = next((path for path in candidates if path.is_file()), candidates[0])
     try:
         candidate = candidate.resolve(strict=True)
     except (OSError, RuntimeError):
@@ -520,6 +570,18 @@ def steamcmd_candidates() -> list[Path]:
                 Path("/opt/homebrew/bin/steamcmd"),
             ]
         )
+    elif sys.platform == "linux":
+        candidates.extend([
+            executable_dir() / "steamcmd.sh",
+            executable_dir() / "steamcmd" / "steamcmd.sh",
+            app_data_dir() / "SteamCMD" / "steamcmd.sh",
+            home / "steamcmd" / "steamcmd.sh",
+            home / "SteamCMD" / "steamcmd.sh",
+            home / ".steam" / "steamcmd" / "steamcmd.sh",
+            Path("/usr/games/steamcmd"),
+            Path("/usr/bin/steamcmd"),
+            Path("/usr/local/bin/steamcmd"),
+        ])
     else:
         local_app_data = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
         program_data = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData"))
@@ -561,12 +623,12 @@ def find_steamcmd() -> Path | None:
 
 def install_steamcmd(progress) -> Path:
     install_dir = app_data_dir() / "SteamCMD"
-    executable = install_dir / ("steamcmd.sh" if sys.platform == "darwin" else "steamcmd.exe")
+    executable = install_dir / ("steamcmd.exe" if sys.platform == "win32" else "steamcmd.sh")
     install_dir.mkdir(parents=True, exist_ok=True)
     progress("Downloading SteamCMD from Valve...")
     download_url = STEAMCMD_DOWNLOAD_URLS.get(sys.platform)
     if not download_url:
-        raise RuntimeError("Automatic SteamCMD installation is currently supported on Windows and macOS only.")
+        raise RuntimeError("Automatic SteamCMD installation supports Windows, macOS and Linux.")
     request = urllib.request.Request(
         download_url,
         headers={"User-Agent": f"{APP_NAME}/SteamCMD installer"},
@@ -574,13 +636,13 @@ def install_steamcmd(progress) -> Path:
     archive_path: Path | None = None
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
-            suffix = ".tar.gz" if sys.platform == "darwin" else ".zip"
+            suffix = ".zip" if sys.platform == "win32" else ".tar.gz"
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as archive:
                 shutil.copyfileobj(response, archive)
                 archive_path = Path(archive.name)
         progress("Installing SteamCMD...")
         install_root = install_dir.resolve()
-        if sys.platform == "darwin":
+        if sys.platform != "win32":
             with tarfile.open(archive_path, "r:gz") as archive:
                 for member in archive.getmembers():
                     destination = (install_dir / member.name).resolve()
@@ -610,6 +672,14 @@ def install_steamcmd(progress) -> Path:
 
 def find_or_install_steamcmd(progress) -> Path:
     existing = find_steamcmd()
+    if existing and sys.platform == "linux" and (existing.name == "steamcmd" or not os.access(existing.parent, os.W_OK)):
+        # Distribution wrappers can change their working directory internally.
+        # Use a private install so download redirects and update records agree.
+        private = resolved_executable_path(app_data_dir() / "SteamCMD" / "steamcmd.sh")
+        if private:
+            return private
+        progress("Using a private SteamCMD installation for reliable local-mod downloads.")
+        return install_steamcmd(progress)
     if existing:
         return existing
     progress("SteamCMD is not installed or could not be detected; installing it from Valve...")
@@ -627,9 +697,9 @@ def rimworld_is_running() -> bool:
                 timeout=5,
             )
             return "RimWorld" in result.stdout
-        if sys.platform == "darwin":
+        if sys.platform in {"darwin", "linux"}:
             result = subprocess.run(
-                ["pgrep", "-if", "RimWorld"],
+                ["pgrep", "-if", "RimWorld" if sys.platform == "darwin" else r"(^|/)RimWorld[^/[:space:]]*([[:space:]]|$)"],
                 capture_output=True,
                 text=True,
                 errors="replace",
@@ -896,6 +966,72 @@ def save_disabled_ids(item_ids: set[str]) -> None:
     DISABLED_MODS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def load_action_history() -> list[dict]:
+    if not ACTION_HISTORY_PATH.is_file():
+        return []
+    payload = json.loads(ACTION_HISTORY_PATH.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("entries"), list):
+        raise ValueError("Mod change history is unreadable. Preserve the activity folder before repairing it.")
+    for entry in payload["entries"]:
+        if (not isinstance(entry, dict) or entry.get("kind") not in {"mods", "undo"}
+                or not isinstance(entry.get("id"), str) or not isinstance(entry.get("action"), str)
+                or not isinstance(entry.get("mods"), list) or not entry["mods"]):
+            raise ValueError("Mod change history contains an invalid entry; it has been preserved.")
+        for change in entry["mods"]:
+            if (not isinstance(change, dict) or not valid_mod_item_id(str(change.get("item_id", "")))
+                    or not isinstance(change.get("name"), str)
+                    or change.get("before") not in {"pinned", "disabled", "default"}
+                    or change.get("after") not in {"pinned", "disabled", "default"}):
+                raise ValueError("Mod change history contains an invalid mod; it has been preserved.")
+    return payload["entries"]
+
+
+def mod_override(item_id: str, pins: set[str], disabled: set[str]) -> str:
+    return "pinned" if item_id in pins else "disabled" if item_id in disabled else "default"
+
+
+def latest_undoable_change() -> dict | None:
+    history = load_action_history()
+    undone = {entry.get("target") for entry in history if entry.get("kind") == "undo"}
+    return next((entry for entry in reversed(history) if entry.get("kind") == "mods" and entry.get("id") not in undone), None)
+
+
+def commit_mod_choices(pins: set[str], disabled: set[str], event: dict) -> None:
+    """Keep the journal and both override files together, rolling back on failure."""
+    with _ACTIVITY_LOCK:
+        history = load_action_history()
+        payload = {"version": 1, "entries": [*history, event][-500:]}
+        paths = (ALWAYS_ENABLED_PATH, DISABLED_MODS_PATH, ACTION_HISTORY_PATH)
+        before = {path: path.read_bytes() if path.exists() else None for path in paths}
+        temporary = ACTION_HISTORY_PATH.with_suffix(".tmp")
+        try:
+            ACTION_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            save_always_enabled_ids(pins)
+            save_disabled_ids(disabled)
+            temporary.replace(ACTION_HISTORY_PATH)
+        except OSError:
+            for path, data in before.items():
+                if data is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(data)
+            raise
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def append_activity_log(message: str) -> str:
+    line = f"{_dt.datetime.now().astimezone().isoformat(timespec='seconds')}  {message}\n"
+    with _ACTIVITY_LOCK:
+        ACTIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if ACTIVITY_LOG_PATH.exists() and ACTIVITY_LOG_PATH.stat().st_size > 2_000_000:
+            ACTIVITY_LOG_PATH.replace(ACTIVITY_LOG_PATH.with_suffix(".previous.log"))
+        with ACTIVITY_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+    return line
+
+
 def load_settings() -> dict[str, object]:
     if not SETTINGS_PATH.exists():
         return {}
@@ -918,6 +1054,7 @@ def load_settings() -> dict[str, object]:
         if value:
             settings[key] = str(value)
     settings["exclude_cosmetics"] = payload.get("exclude_cosmetics") is True
+    settings["excluded_dlcs"] = sorted(normalize_excluded_dlcs(payload.get("excluded_dlcs", [])))
     settings["auto_update_on_launch"] = payload.get("auto_update_on_launch") is True
     return settings
 
@@ -1638,6 +1775,7 @@ def read_mod_metadata(mod_dir: Path, item_id: str) -> ModMetadata | None:
     dependencies = xml_text_values(root.find("modDependencies"), "packageId")
     load_after = xml_text_values(root.find("loadAfter"), "li")
     load_before = xml_text_values(root.find("loadBefore"), "li")
+    by_version = root.find("modDependenciesByVersion")
     return ModMetadata(
         item_id=item_id,
         package_id=package_id,
@@ -1645,6 +1783,10 @@ def read_mod_metadata(mod_dir: Path, item_id: str) -> ModMetadata | None:
         dependencies=tuple(dict.fromkeys(dependencies)),
         load_after=tuple(dict.fromkeys(load_after)),
         load_before=tuple(dict.fromkeys(load_before)),
+        dependencies_by_version=tuple(
+            (node.tag.removeprefix("v"), tuple(xml_text_values(node, "packageId")))
+            for node in by_version
+        ) if by_version is not None else (),
     )
 
 
@@ -1691,7 +1833,7 @@ def cached_mod_metadata(mod_dir: Path, item_id: str) -> ModMetadata | None:
     cache = load_local_metadata_cache()
     key = str(about_path.resolve())
     cached = cache.get(key)
-    if isinstance(cached, dict) and cached.get("signature") == signature:
+    if isinstance(cached, dict) and cached.get("signature") == signature and cached.get("schema") == 2:
         _local_metadata_cache_hits += 1
         metadata = cached.get("metadata")
         if not isinstance(metadata, dict):
@@ -1703,10 +1845,12 @@ def cached_mod_metadata(mod_dir: Path, item_id: str) -> ModMetadata | None:
             dependencies=tuple(str(value) for value in metadata.get("dependencies", [])),
             load_after=tuple(str(value) for value in metadata.get("load_after", [])),
             load_before=tuple(str(value) for value in metadata.get("load_before", [])),
+            dependencies_by_version=tuple((str(version), tuple(deps)) for version, deps in metadata.get("dependencies_by_version", [])),
         )
 
     metadata = read_mod_metadata(mod_dir, item_id)
     cache[key] = {
+        "schema": 2,
         "signature": signature,
         "metadata": (
             {
@@ -1715,6 +1859,7 @@ def cached_mod_metadata(mod_dir: Path, item_id: str) -> ModMetadata | None:
                 "dependencies": list(metadata.dependencies),
                 "load_after": list(metadata.load_after),
                 "load_before": list(metadata.load_before),
+                "dependencies_by_version": metadata.dependencies_by_version,
             }
             if metadata
             else None
@@ -1797,6 +1942,120 @@ def find_quarantined_mods(workshop_path: Path) -> list[QuarantinedMod]:
     return quarantined
 
 
+def normalize_excluded_dlcs(values) -> set[str]:
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return set()
+    return {str(value).lower() for value in values if str(value).lower() in DLC_PACKAGES}
+
+
+def scan_game_version(local_mods_path: Path, config_path: Path) -> str:
+    try:
+        return (rimworld_game_root_from_mods_path(local_mods_path) / "Version.txt").read_text(encoding="utf-8").strip()
+    except OSError:
+        return existing_config_version(config_path)
+
+
+def dependencies_for_version(metadata: ModMetadata, game_version: str) -> set[str]:
+    def version_key(value):
+        match = re.match(r"v?(\d+)\.(\d+)", value)
+        return tuple(map(int, match.groups())) if match else (0, 0)
+    target = version_key(game_version)
+    candidates = [(version_key(version), deps) for version, deps in metadata.dependencies_by_version if version_key(version) <= target]
+    selected = max(candidates, key=lambda item: item[0])[1] if candidates else ()
+    return set(metadata.dependencies) | set(selected)
+
+
+def dlc_excluded_mods(required: dict[str, WorkshopItem], item_paths: dict[str, Path],
+                      excluded_dlcs: set[str], game_version: str,
+                      mod_roots: tuple[Path, Path]) -> dict[str, tuple[str, ...]]:
+    if not excluded_dlcs:
+        return {}
+    # Remember previously read requirements when a mod is currently absent.
+    # Unknown first-time downloads are checked on the mandatory post-download scan.
+    remembered = {}
+    roots = {path.resolve() for path in mod_roots}
+    for path_text, entry in load_local_metadata_cache().items():
+        path = Path(path_text)
+        if len(path.parents) < 3 or path.parents[2].resolve() not in roots:
+            continue
+        item_id = path.parents[1].name
+        record = entry.get("metadata") if isinstance(entry, dict) else None
+        if item_id not in required or not isinstance(record, dict):
+            continue
+        signature = entry.get("signature", [0])[0]
+        if signature < remembered.get(item_id, (0, None))[0]:
+            continue
+        remembered[item_id] = (signature, ModMetadata(
+            item_id, str(record.get("package_id", "")).lower(), str(record.get("name", item_id)),
+            tuple(record.get("dependencies", [])), (), (),
+            tuple((str(v), tuple(deps)) for v, deps in record.get("dependencies_by_version", [])),
+        ))
+    corrections_by_id = {item_id: (package, dlc) for package, (item_id, dlc) in DLC_REQUIREMENT_CORRECTIONS.items()}
+    item_packages = {}
+    graph: dict[str, set[str]] = {}
+    for item_id in set(required) | set(item_paths):
+        path = item_paths.get(item_id)
+        metadata = cached_mod_metadata(path, item_id) if path is not None else None
+        if metadata is None:
+            metadata = remembered.get(item_id, (0, None))[1]
+        correction = corrections_by_id.get(item_id)
+        package = metadata.package_id if metadata else correction[0] if correction else "workshop." + item_id
+        item_packages[item_id] = package
+        deps = dependencies_for_version(metadata, game_version) if metadata else set()
+        if package in DLC_REQUIREMENT_CORRECTIONS:
+            deps.add(DLC_REQUIREMENT_CORRECTIONS[package][1])
+        if correction:
+            deps.add(correction[1])
+        graph.setdefault(package, set()).update(deps)
+    reasons = {dlc: {dlc} for dlc in excluded_dlcs}
+    changed = True
+    while changed:
+        changed = False
+        for package, deps in graph.items():
+            inherited = reasons.get(package, set()) | set().union(*(reasons.get(dependency, set()) for dependency in deps))
+            if inherited and inherited != reasons.get(package):
+                reasons[package] = inherited
+                changed = True
+    return {item: tuple(sorted(reasons[package])) for item, package in item_packages.items() if package in reasons}
+
+
+def verified_aspen_provider(mod_path: Path, config_path: Path, local_mods_path: Path) -> bool:
+    """Recognize the merged Aspen content in the effective, loadable Core copy."""
+    try:
+        version_path = rimworld_game_root_from_mods_path(local_mods_path) / "Version.txt"
+        version = version_path.read_text(encoding="utf-8") if version_path.is_file() else (
+            existing_config_version(config_path) if config_path.is_file() else ""
+        )
+        match = re.match(r"(1\.[67])(?:\D|$)", version.strip())
+        if not match or read_package_id(mod_path).lower() != "regrowth.botr.core":
+            return False
+        folders = ET.parse(mod_path / "loadFolders.xml").getroot()
+        branch = folders.find("v" + match.group(1))
+        if branch is None and match.group(1) == "1.7":
+            branch = folders.find("v1.6")
+        if branch is None:
+            return False
+        # Only an unconditional content folder qualifies. Do not infer a merger
+        # from an unrelated version, conditional patch, cached title or version number.
+        roots = [(node.text or "").strip() for node in branch.findall("li") if not node.attrib]
+        for root in roots:
+            if root not in {"1.6", "1.7"}:
+                continue
+            content = mod_path / root
+            biome = ET.parse(content / "Defs/BiomeDefs/Biomes_Aspen.xml").getroot()
+            plants = ET.parse(content / "Defs/ThingDefs_Plants/Plants_Wild_Aspen.xml").getroot()
+            biome_names = {node.text for node in biome.findall("./BiomeDef/defName")}
+            plant_names = {node.text for node in plants.findall("./ThingDef/defName")}
+            assembly = (content / "Assemblies/ReGrowthCore.dll").read_bytes()
+            if ("RG_AspenForest" in biome_names
+                    and {"RG_Plant_AspenGrass", "RG_Plant_TreeAspenRed", "RG_Plant_TreeAspenYellow"} <= plant_names
+                    and b"BiomeWorker_AspenForest" in assembly):
+                return True
+    except (OSError, ET.ParseError):
+        return False
+    return False
+
+
 def scan_with_required(
     required_snapshot: dict[str, WorkshopItem],
     workshop_path: Path,
@@ -1804,6 +2063,7 @@ def scan_with_required(
     mods_config_path: Path,
     progress,
     exclude_cosmetics: bool = False,
+    excluded_dlcs=None,
 ) -> ScanResult:
     cache_hits_before = _local_metadata_cache_hits
     required = dict(required_snapshot)
@@ -1837,16 +2097,40 @@ def scan_with_required(
     required = {
         item_id: item
         for item_id, item in required.items()
-        if item.title or item_id in installed_ids
+        if item.title or item_id in installed_ids or item_id.isdigit()
     }
-    required_ids = set(required)
-    required_order = list(required)
     always_enabled_ids = load_always_enabled_ids()
     disabled_ids = load_disabled_ids()
     disabled_ids.difference_update(always_enabled_ids)
+    excluded_dlcs = normalize_excluded_dlcs(excluded_dlcs)
+    dlc_exclusions = dlc_excluded_mods(required, item_paths, excluded_dlcs,
+                                    scan_game_version(local_mods_path, mods_config_path), (workshop_path, local_mods_path))
+    dlc_excluded_items = {item: required.pop(item) for item in dlc_exclusions if item in required}
+    # Exclusions win for the current live profile; the saved pins are untouched.
+    always_enabled_ids.difference_update(dlc_exclusions)
+    disabled_ids.update(dlc_exclusions)
+    if excluded_dlcs:
+        progress(f"DLC exclusions: {', '.join(DLC_PACKAGES[dlc] for dlc in sorted(excluded_dlcs))}; skipping {len(dlc_exclusions)} mod(s), including dependent mods.")
     if exclude_cosmetics:
         always_enabled_ids.difference_update(cosmetic_ids)
         disabled_ids.update(cosmetic_ids & installed_ids)
+    merged_items: dict[str, str] = {}
+    for old_id, (title, provider_id, expected_package) in MERGED_WORKSHOP_ITEMS.items():
+        if old_id not in required or old_id in always_enabled_ids:
+            continue
+        if provider_id not in required and provider_id not in always_enabled_ids:
+            continue
+        if provider_id in disabled_ids and provider_id not in always_enabled_ids:
+            continue
+        provider = item_paths.get(provider_id)
+        if (provider_id in ready_ids and provider is not None
+                and package_ids.get(provider_id, "").lower() == expected_package
+                and verified_aspen_provider(provider, mods_config_path, local_mods_path)):
+            merged_items[old_id] = provider_id
+            del required[old_id]
+            progress(f"Verified replacement: {title} is included in installed ReGrowth 2. No separate Aspen download is needed.")
+    required_ids = set(required)
+    required_order = list(required)
     return ScanResult(
         required=required,
         required_order=required_order,
@@ -1855,8 +2139,8 @@ def scan_with_required(
         item_paths=item_paths,
         local_steamcmd_ids={item_id for item_id in local_ids if item_id.isdigit()},
         steam_registered_ids=steam_ready_ids,
-        missing_ids=[item_id for item_id in required_order if item_id not in installed_ids],
-        unregistered_ids=[item_id for item_id in required_order if item_id in workshop_ids and item_id not in ready_ids],
+        missing_ids=[item_id for item_id in required_order if item_id not in installed_ids and (item_id not in disabled_ids or item_id in always_enabled_ids)],
+        unregistered_ids=[item_id for item_id in required_order if item_id in workshop_ids and item_id not in ready_ids and (item_id not in disabled_ids or item_id in always_enabled_ids)],
         extra_ids=sorted(installed_ids - required_ids, key=mod_item_sort_key),
         ready_ids=[item_id for item_id in required_order if item_id in ready_ids],
         always_enabled_ids=always_enabled_ids,
@@ -1864,6 +2148,10 @@ def scan_with_required(
         workshop_path=workshop_path,
         local_mods_path=local_mods_path,
         mods_config_path=mods_config_path,
+        merged_items=merged_items,
+        excluded_dlcs=excluded_dlcs,
+        dlc_exclusions=dlc_exclusions,
+        dlc_excluded_items=dlc_excluded_items,
     )
 
 
@@ -1873,6 +2161,7 @@ def scan(
     mods_config_path: Path,
     progress,
     exclude_cosmetics: bool = False,
+    excluded_dlcs=None,
 ) -> ScanResult:
     return scan_with_required(
         fetch_required_items(progress),
@@ -1881,6 +2170,7 @@ def scan(
         mods_config_path,
         progress,
         exclude_cosmetics,
+        excluded_dlcs,
     )
 
 
@@ -1972,6 +2262,8 @@ def rimworld_executable(game_root: Path) -> Path | None:
                     candidates.insert(0, game_root / "Contents" / "MacOS" / str(executable_name))
             except (OSError, plistlib.InvalidFileException):
                 pass
+    elif sys.platform == "linux":
+        candidates = [game_root / name for name in ("RimWorld", "RimWorldLinux", "RimWorldLinux.x86_64", "RimWorldLinux.x86")]
     else:
         candidates = [
             game_root / "RimWorldWin64.exe",
@@ -2449,18 +2741,43 @@ def relocate_unregistered_workshop_mods(result: ScanResult, targets: list[str], 
     return moved
 
 
+def unavailable_workshop_message(result: ScanResult, item_ids: list[str]) -> str:
+    lines = ["Steam cannot provide the following required mod(s). Setup has stopped before launching:"]
+    for item_id in item_ids:
+        item = result.required.get(item_id)
+        title = item.title if item and item.title else item_id
+        lines.append(f"- {title} ({item_id}): {WORKSHOP_URL.format(id=item_id)}")
+        if item_id in MERGED_WORKSHOP_ITEMS:
+            lines.append(
+                "  Aspen is now included in updated ReGrowth 2. Update and enable ReGrowth 2, then scan again. "
+                "The launcher will skip the standalone download only after verifying the merged content. "
+                "An explicit Always Enabled selection for standalone Aspen must be reset first."
+            )
+    lines.append(
+        "The Workshop item may have been removed, made private, or become inaccessible. "
+        "Repeating the same download will not resolve this response. Restore a complete trusted copy "
+        "or check the modpack author's replacement instructions. Other missing mods are not automatically skipped."
+    )
+    lines.append("To deliberately exclude an unavailable mod, select it in the table and choose Always Disable Selected. Review save and dependency compatibility first.")
+    return "\n".join(lines)
+
+
 def run_steamcmd_downloads(
     result: ScanResult,
     progress,
     targets: list[str] | None = None,
     progress_count=None,
 ) -> Path:
-    steamcmd = find_or_install_steamcmd(progress)
     targets = targets or download_target_ids(result)
     if not targets:
         raise RuntimeError("There are no SteamCMD mods to download or validate.")
 
     targets = list(dict.fromkeys(targets))
+    unavailable: set[str] = set()
+    fetch_remote_update_times(targets, progress, unavailable_out=unavailable)
+    if unavailable:
+        raise RuntimeError(unavailable_workshop_message(result, [item for item in targets if item in unavailable]))
+    steamcmd = find_or_install_steamcmd(progress)
     total = len(targets)
     completed_ids: set[str] = set()
     failed_item_ids: set[str] = set()
@@ -2520,6 +2837,8 @@ def run_steamcmd_downloads(
                         item_match = re.search(r"\bitem\s+(\d+)\b", line, re.IGNORECASE)
                         if item_match and item_match.group(1) in targets:
                             failed_item_ids.add(item_match.group(1))
+                            if "FILE NOT FOUND" in upper_line or "ACCESS DENIED" in upper_line:
+                                unavailable.add(item_match.group(1))
                     match = re.search(r"Success\.\s+Downloaded item\s+(\d+)", line, re.IGNORECASE)
                     if match and match.group(1) in targets and match.group(1) not in completed_ids:
                         completed_ids.add(match.group(1))
@@ -2538,6 +2857,8 @@ def run_steamcmd_downloads(
         return detected_error
 
     error_detected = execute_batches(targets)
+    if unavailable:
+        raise RuntimeError(unavailable_workshop_message(result, [item for item in targets if item in unavailable]))
     if error_detected:
         loadable = loadable_ids(targets)
         retry_ids = [
@@ -2581,6 +2902,7 @@ def texture_optimization_paths(result: ScanResult) -> list[Path]:
         raise RuntimeError("An Always Enabled mod is missing. Restore it before optimizing textures.")
     selected = set(result.ready_ids) - result.disabled_ids
     selected.update(result.always_enabled_ids)
+    selected.difference_update(result.dlc_exclusions)
     roots = {result.local_mods_path.resolve(), result.workshop_path.resolve()}
     paths = []
     for item_id in sorted(selected, key=mod_item_sort_key):
@@ -2739,7 +3061,7 @@ def stable_topological_sort(nodes: list[str], edges: list[tuple[str, str]]) -> t
 
 
 def build_vanilla_sorted_active_list(result: ScanResult) -> SortResult:
-    ludeon_mods = existing_ludeon_active_mods(result.mods_config_path)
+    ludeon_mods = [package for package in existing_ludeon_active_mods(result.mods_config_path) if package not in result.excluded_dlcs]
     existing_order = existing_active_mods(result.mods_config_path)
     active_item_ids = [
         *[
@@ -2753,7 +3075,9 @@ def build_vanilla_sorted_active_list(result: ScanResult) -> SortResult:
             if item_id in result.installed_ids and item_id not in result.ready_ids
         ],
     ]
+    active_item_ids = [item for item in active_item_ids if item not in result.dlc_exclusions]
     metadata = read_installed_metadata(result.item_paths, active_item_ids)
+    game_version = scan_game_version(result.local_mods_path, result.mods_config_path)
     active_package_ids = [
         result.installed_package_ids[item_id]
         for item_id in active_item_ids
@@ -2805,7 +3129,7 @@ def build_vanilla_sorted_active_list(result: ScanResult) -> SortResult:
     for package_id, meta in metadata.items():
         if package_id not in active_set:
             continue
-        for dependency in meta.dependencies:
+        for dependency in dependencies_for_version(meta, game_version):
             if dependency in active_set:
                 edges.append((dependency, package_id))
                 dependency_edges += 1
@@ -2841,6 +3165,7 @@ def sort_cache_key(result: ScanResult) -> str:
             if item_id in result.installed_ids and item_id not in result.ready_ids
         ],
     ]
+    active_item_ids = [item for item in active_item_ids if item not in result.dlc_exclusions]
     about_signatures: list[list[object]] = []
     for item_id in active_item_ids:
         mod_path = result.item_paths.get(item_id)
@@ -2862,6 +3187,8 @@ def sort_cache_key(result: ScanResult) -> str:
     except OSError:
         config_digest = ""
     payload = {
+        "excluded_dlcs": sorted(result.excluded_dlcs),
+        "dlc_exclusions": sorted(result.dlc_exclusions),
         "required_order": result.required_order,
         "active_item_ids": active_item_ids,
         "always_enabled_ids": sorted(result.always_enabled_ids, key=mod_item_sort_key),
@@ -2921,12 +3248,27 @@ def get_or_build_sort_result(result: ScanResult, progress=None) -> SortResult:
     return sort_result
 
 
+def verify_merged_replacements(result: ScanResult) -> None:
+    for old_id, provider_id in result.merged_items.items():
+        provider = result.item_paths.get(provider_id)
+        if (provider is None or provider_id not in result.ready_ids
+                or (provider_id in result.disabled_ids and provider_id not in result.always_enabled_ids)
+                or not verified_aspen_provider(provider, result.mods_config_path, result.local_mods_path)):
+            raise RuntimeError("ReGrowth 2 changed or is no longer enabled after scanning. Scan again before replacing standalone Aspen.")
+
+
 def write_mods_config(
     result: ScanResult,
     progress,
     sort_result: SortResult | None = None,
 ) -> Path:
+    verify_merged_replacements(result)
     sort_result = sort_result or get_or_build_sort_result(result, progress)
+    forbidden = result.excluded_dlcs | {
+        result.installed_package_ids[item] for item in result.dlc_exclusions if item in result.installed_package_ids
+    }
+    if forbidden & set(sort_result.package_ids):
+        raise RuntimeError("The prepared mod list includes DLC-excluded content. Scan and sort again before applying it.")
     if not sort_result.package_ids:
         raise RuntimeError("No installed Workshop package IDs were found. Download the missing mods first, then scan again.")
 
@@ -3157,11 +3499,39 @@ class HoverTooltip:
             self.window = None
 
 
+class UndoIconButton(tk.Canvas):
+    """A drawn undo arrow works without platform-specific symbol fonts."""
+    def __init__(self, parent, command):
+        super().__init__(parent, width=34, height=30, bg="#1b252b", highlightthickness=1,
+                         highlightbackground="#33414c", highlightcolor="#81cfc0", takefocus=True)
+        self.command = command
+        self.enabled = False
+        self.bind("<Button-1>", self.invoke)
+        self.bind("<Return>", self.invoke)
+        self.bind("<space>", self.invoke)
+        self.bind("<Enter>", lambda _event: self.configure(bg="#26343d" if self.enabled else "#1b252b"))
+        self.bind("<Leave>", lambda _event: self.configure(bg="#1b252b"))
+        self.set_enabled(False)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self.configure(cursor="hand2" if enabled else "arrow")
+        self.delete("all")
+        self.create_line(25, 24, 28, 18, 25, 11, 18, 8, 9, 13,
+                         smooth=True, width=2, fill="#81cfc0" if enabled else "#53616d",
+                         arrow="last", arrowshape=(6, 7, 3))
+
+    def invoke(self, _event=None):
+        if self.enabled:
+            self.command()
+        return "break"
+
+
 class ProgressButton(tk.Canvas):
     def __init__(self, parent: tk.Widget, command) -> None:
         super().__init__(
             parent,
-            height=68,
+            height=48,
             bg="#c27a2c",
             highlightthickness=0,
             borderwidth=0,
@@ -3245,7 +3615,7 @@ class ProgressButton(tk.Canvas):
             height // 2,
             text=self.button_text,
             fill="#111111" if self.button_state == "normal" else "#3e342b",
-            font=("Segoe UI", 20, "bold"),
+            font=("Segoe UI", 14, "bold"),
         )
 
 
@@ -3281,6 +3651,9 @@ class ProgressorApp(tk.Tk):
             value=saved_settings.get("auto_update_on_launch") is True
         )
         self.exclude_cosmetics = BooleanVar(value=saved_settings.get("exclude_cosmetics") is True)
+        saved_dlc_exclusions = normalize_excluded_dlcs(saved_settings.get("excluded_dlcs", []))
+        self.dlc_choices = {package: BooleanVar(value=package in saved_dlc_exclusions) for package in DLC_PACKAGES}
+        self.dlc_checkbuttons = []
         self.current_result: ScanResult | None = None
         self._busy = False
         self.current_sort_result: SortResult | None = None
@@ -3315,6 +3688,18 @@ class ProgressorApp(tk.Tk):
         self.main_pane: ttk.PanedWindow | None = None
         self.mod_table_frame: ttk.Frame | None = None
         self.frozen_visible = False
+        self.row_records = {}
+        self.selected_tree = None
+        self.log_visible = False
+        self.locations_visible = False
+        self.inactive_sort_column = "attention"
+        self.inactive_sort_reverse = False
+        self.library_summary = tk.StringVar(value="Loading your mod library…")
+        self.active_count = tk.StringVar(value="Active")
+        self.inactive_count = tk.StringVar(value="Inactive & missing")
+        self.detail_title = tk.StringVar(value="Select a mod")
+        self.detail_subtitle = tk.StringVar(value="Details, requirements and actions")
+        self.undo_description = "No manual mod changes to undo."
 
         self._build_ui()
         self.update_quick_frozen_button()
@@ -3327,15 +3712,15 @@ class ProgressorApp(tk.Tk):
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure(".", background="#101418", foreground="#d7dedb", fieldbackground="#171d22")
+        style.configure(".", background="#101418", foreground="#d7dedb", fieldbackground="#171d22", font=("Segoe UI", 10))
         style.configure("TFrame", background="#101418")
         style.configure("TLabel", background="#101418", foreground="#d7dedb")
         style.configure("TLabelframe", background="#101418", foreground="#d7dedb", bordercolor="#2b353c")
         style.configure("TLabelframe.Label", background="#101418", foreground="#f2b35d")
-        style.configure("TButton", background="#1b252b", foreground="#e9efec", bordercolor="#41515a", focusthickness=0, padding=(10, 6))
+        style.configure("TButton", background="#1b252b", foreground="#e9efec", bordercolor="#33414c", lightcolor="#1b252b", darkcolor="#1b252b", focusthickness=0, padding=(10, 6))
         style.map("TButton", background=[("active", "#26343d")], foreground=[("active", "#ffffff")])
         style.configure("TCheckbutton", background="#101418", foreground="#d7dedb")
-        style.configure("TCombobox", fieldbackground="#161d22", foreground="#eef3ef", arrowcolor="#f2b35d")
+        style.configure("TCombobox", fieldbackground="#161d22", background="#202b34", foreground="#eef3ef", arrowcolor="#9fb1bd", bordercolor="#33414c", lightcolor="#202b34", darkcolor="#202b34", padding=5)
         style.map(
             "TCombobox",
             fieldbackground=[("readonly", "#161d22")],
@@ -3347,23 +3732,29 @@ class ProgressorApp(tk.Tk):
         self.option_add("*TCombobox*Listbox.foreground", "#d7dedb")
         self.option_add("*TCombobox*Listbox.selectBackground", "#2d4b55")
         self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
-        style.configure("TEntry", fieldbackground="#161d22", foreground="#eef3ef", insertcolor="#eef3ef")
-        style.configure("Treeview", background="#12181d", foreground="#d7dedb", fieldbackground="#12181d", bordercolor="#2b353c", rowheight=24)
-        style.configure("Treeview.Heading", background="#1d272e", foreground="#f2b35d")
+        style.configure("TEntry", fieldbackground="#161d22", foreground="#eef3ef", insertcolor="#eef3ef", bordercolor="#33414c", lightcolor="#161d22", darkcolor="#161d22", padding=6)
+        style.configure("Treeview", background="#151c22", foreground="#d7dedb", fieldbackground="#151c22", bordercolor="#28353f", lightcolor="#151c22", darkcolor="#151c22", borderwidth=0, rowheight=30)
+        style.configure("Treeview.Heading", background="#202b34", foreground="#9fb1bd", padding=(8, 8), relief="flat", font=("Segoe UI", 9, "bold"))
         style.map("Treeview", background=[("selected", "#2d4b55")], foreground=[("selected", "#ffffff")])
         style.configure("TPanedwindow", background="#101418")
+        style.configure("Muted.TLabel", foreground="#8798a5")
+        style.configure("Title.TLabel", font=("Segoe UI", 12, "bold"), foreground="#eef3ef")
+        style.configure("Accent.TButton", background="#315e62", foreground="#ffffff", borderwidth=0)
+        style.map("Accent.TButton", background=[("active", "#3a7377")])
+        style.configure("TScrollbar", background="#34434e", troughcolor="#151c22", arrowcolor="#8798a5", bordercolor="#151c22", lightcolor="#34434e", darkcolor="#34434e", gripcount=0, arrowsize=12)
+        style.map("TScrollbar", background=[("active", "#506575")])
 
     def _build_ui(self) -> None:
         self._configure_styles()
         self.columnconfigure(0, weight=1)
         self.rowconfigure(4, weight=1)
 
-        header = ttk.Frame(self, padding=(18, 14, 18, 8))
+        header = ttk.Frame(self, padding=(20, 12, 20, 6))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
         logo_path = asset_path("progression_logo.png")
         if logo_path.exists():
-            self.logo_image = tk.PhotoImage(file=str(logo_path)).subsample(2, 2)
+            self.logo_image = tk.PhotoImage(file=str(logo_path)).subsample(3, 3)
             tk.Label(header, image=self.logo_image, bg="#101418", bd=0).grid(row=0, column=0, sticky="w")
         else:
             ttk.Label(header, text="PROGRESSION", font=("Segoe UI", 28, "bold"), foreground="#f2b35d").grid(row=0, column=0, sticky="w")
@@ -3377,10 +3768,13 @@ class ProgressorApp(tk.Tk):
         quick = ttk.Frame(self, padding=(18, 4, 18, 12))
         quick.grid(row=1, column=0, sticky="ew")
         quick.columnconfigure(0, weight=1)
+        ttk.Label(quick, text="Your live modpack", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(quick, textvariable=self.library_summary, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.play_button = ProgressButton(quick, self.play_now)
-        self.play_button.grid(row=0, column=0, sticky="ew")
+        self.play_button.configure(width=260)
+        self.play_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(20, 0))
         frozen_quick = ttk.Frame(quick)
-        frozen_quick.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        frozen_quick.grid(row=2, column=0, sticky="w", pady=(8, 0))
         frozen_quick.columnconfigure(0, weight=1)
         self.quick_frozen_button = tk.Button(
             frozen_quick,
@@ -3393,7 +3787,7 @@ class ProgressorApp(tk.Tk):
             font=("Segoe UI", 11, "bold"),
             relief="flat",
             padx=18,
-            pady=9,
+            pady=5,
             cursor="hand2",
         )
         self.quick_frozen_button.grid(row=0, column=0, sticky="ew")
@@ -3414,14 +3808,9 @@ class ProgressorApp(tk.Tk):
             quick,
             textvariable=self.busy_message,
             foreground="#f2b35d",
-        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(
-            quick,
-            text="Scans the pack, downloads missing mods, disables extras, activates and sorts, then launches RimWorld.",
-            foreground="#9fb1ad",
-        ).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ).grid(row=3, column=0, sticky="w", pady=(4, 0))
         self.advanced_button = ttk.Button(quick, text="Show Advanced Options", command=self.toggle_advanced)
-        self.advanced_button.grid(row=3, column=1, sticky="e", padx=(12, 0), pady=(6, 0))
+        self.advanced_button.grid(row=2, column=1, sticky="e", padx=(12, 0), pady=(8, 0))
 
         self.advanced_frame = ttk.Frame(self, padding=(18, 0, 18, 8))
         self.advanced_frame.columnconfigure(0, weight=1)
@@ -3469,13 +3858,10 @@ class ProgressorApp(tk.Tk):
         self.optimize_button = ttk.Button(toolbar, text="Optimize Textures", command=self.optimize_textures)
         self.optimize_button.pack(side="left", padx=6)
         HoverTooltip(self.optimize_button, lambda: "CPU compression for the live pack + Always Enabled mods; original PNGs retained.")
-        ttk.Button(toolbar, text="Always Enable Selected", command=self.always_enable_selected).pack(side="left", padx=6)
-        ttk.Button(toolbar, text="Reset Selected", command=self.reset_selected).pack(side="left", padx=6)
-        ttk.Button(toolbar, text="Always Disable Selected", command=self.disable_selected).pack(side="left", padx=6)
-        ttk.Button(toolbar, text="Apply Mod List + Sort", command=self.write_config).pack(side="left", padx=6)
+        ttk.Button(toolbar, text="Locations", command=self.toggle_locations).pack(side="left", padx=6)
         self.frozen_button = ttk.Button(toolbar, text="Frozen Profiles", command=self.toggle_frozen_options)
         self.frozen_button.pack(side="left", padx=6)
-        ttk.Button(toolbar, text="Launch RimWorld", command=self.advanced_launch).pack(side="right")
+        paths.grid_remove()
 
         options_row = ttk.Frame(self.advanced_frame)
         options_row.grid(row=2, column=0, sticky="w", pady=(6, 0))
@@ -3496,6 +3882,15 @@ class ProgressorApp(tk.Tk):
             variable=self.exclude_cosmetics,
             command=self.cosmetics_setting_changed,
         ).pack(side="left", padx=6)
+        dlc_options = ttk.Frame(self.advanced_frame)
+        dlc_options.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        dlc_label = ttk.Label(dlc_options, text="Skip DLC:")
+        dlc_label.pack(side="left", padx=(0, 4))
+        HoverTooltip(dlc_label, lambda: "Checked DLC and mods that require it are excluded from the live profile, including pinned mods and their dependents. Your pins are remembered. Existing frozen profiles are unchanged.")
+        for package, label in DLC_PACKAGES.items():
+            checkbox = ttk.Checkbutton(dlc_options, text=label, variable=self.dlc_choices[package], command=self.dlc_setting_changed)
+            checkbox.pack(side="left", padx=3)
+            self.dlc_checkbuttons.append(checkbox)
 
         self.frozen_frame = ttk.Frame(self.advanced_frame, padding=(0, 8, 0, 0))
         self.frozen_frame.grid(row=3, column=0, sticky="ew")
@@ -3526,168 +3921,313 @@ class ProgressorApp(tk.Tk):
 
         main = ttk.PanedWindow(self, orient="horizontal")
         self.main_pane = main
-        main.grid(row=4, column=0, sticky="nsew", padx=18, pady=(0, 14))
+        main.grid(row=4, column=0, sticky="nsew", padx=20, pady=(6, 8))
 
-        left = ttk.Frame(main)
-        left.columnconfigure(0, weight=1)
-        left.rowconfigure(1, weight=1)
-        ttk.Label(left, text="Status", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 6))
-        self.status = tk.Text(
-            left,
-            height=12,
-            wrap="word",
-            state="disabled",
-            bg="#0d1115",
-            fg="#d7dedb",
-            insertbackground="#d7dedb",
-            relief="flat",
-            padx=10,
-            pady=8,
-        )
-        self.status.grid(row=1, column=0, sticky="nsew")
-        main.add(left, weight=1)
+        inspector = ttk.Frame(main, width=265, padding=(0, 0, 16, 0))
+        inspector.columnconfigure(0, weight=1)
+        inspector.rowconfigure(3, weight=1)
+        ttk.Label(inspector, text="MOD DETAILS", style="Muted.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 16))
+        ttk.Label(inspector, textvariable=self.detail_title, style="Title.TLabel", wraplength=240).grid(row=1, column=0, sticky="ew")
+        ttk.Label(inspector, textvariable=self.detail_subtitle, style="Muted.TLabel", wraplength=240).grid(row=2, column=0, sticky="ew", pady=(8, 12))
+        self.detail_text = tk.Text(inspector, wrap="word", width=27, height=10, bg="#101418", fg="#aebcc6", relief="flat", borderwidth=0, font=("Segoe UI", 10), state="disabled", cursor="arrow")
+        self.detail_text.grid(row=3, column=0, sticky="nsew")
+        self.workshop_button = ttk.Button(inspector, text="Steam Workshop ↗", command=self.open_selected_workshop_page, state="disabled")
+        self.workshop_button.grid(row=4, column=0, sticky="ew", pady=(10, 4))
+        self.folder_button = ttk.Button(inspector, text="Open mod folder", command=self.open_selected_mod_folder, state="disabled")
+        self.folder_button.grid(row=5, column=0, sticky="ew")
+        main.add(inspector, weight=1)
 
         right = ttk.Frame(main)
         self.mod_table_frame = right
         right.columnconfigure(0, weight=1)
         right.rowconfigure(2, weight=1)
-        header_row = ttk.Frame(right)
-        header_row.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
-        header_row.columnconfigure(0, weight=1)
-        ttk.Label(header_row, textvariable=self.table_title, font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w")
-
         filters = ttk.Frame(right)
-        filters.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 6))
-        ttk.Label(filters, text="View").pack(side="left")
-        view_combo = ttk.Combobox(
-            filters,
-            textvariable=self.table_view,
-            values=("Mod Differences", "Active Load Order"),
-            state="readonly",
-            width=18,
-        )
-        view_combo.pack(side="left", padx=(6, 14))
-        view_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_mod_filters())
-        ttk.Label(filters, text="State").pack(side="left")
-        self.state_combo = ttk.Combobox(
-            filters,
-            textvariable=self.state_filter,
-            values=(
-                "All states",
-                "Missing",
-                "Needs SteamCMD",
-                "Enabled",
-                "Disabled",
-                "Always Enabled",
-                "Always Disabled",
-            ),
-            state="readonly",
-            width=16,
-        )
-        self.state_combo.pack(side="left", padx=(6, 14))
+        filters.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        filters.columnconfigure(1, weight=1)
+        ttk.Label(filters, text="Find mods", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 8))
+        self.search_entry = ttk.Entry(filters, textvariable=self.mod_search)
+        self.search_entry.grid(row=0, column=1, sticky="ew")
+        self.search_entry.bind("<KeyRelease>", lambda _event: self.schedule_mod_search())
+        self.search_entry.bind("<Escape>", lambda _event: self.clear_mod_search())
+        ttk.Button(filters, text="Clear", command=self.clear_mod_search).grid(row=0, column=2, padx=(6, 0))
+        self.bind("<Control-f>", lambda _event: self.search_entry.focus_set())
+        if sys.platform == "darwin":
+            self.bind("<Command-f>", lambda _event: self.search_entry.focus_set())
+        self.state_combo = ttk.Combobox(filters, textvariable=self.state_filter, values=("All states", "Needs attention", "Pinned", "DLC excluded", "Missing", "Needs SteamCMD", "Always Disabled", "Disabled"), state="readonly", width=18)
+        self.state_combo.grid(row=0, column=3, padx=(12, 0))
         self.state_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_mod_filters())
-        ttk.Label(filters, text="Pack").pack(side="left")
-        self.pack_combo = ttk.Combobox(
-            filters,
-            textvariable=self.pack_filter,
-            values=("All packs", "Core", "Content", "Cosmetics", "Local", "Workshop"),
-            state="readonly",
-            width=16,
-        )
-        self.pack_combo.pack(side="left", padx=(6, 0))
+        self.pack_combo = ttk.Combobox(filters, textvariable=self.pack_filter, values=("All packs", "Core", "Content", "Cosmetics", "Local", "Workshop", "Game"), state="readonly", width=12)
+        self.pack_combo.grid(row=0, column=4, padx=(8, 0))
         self.pack_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_mod_filters())
-        ttk.Label(filters, text="Search").pack(side="left", padx=(14, 0))
-        search_entry = ttk.Entry(filters, textvariable=self.mod_search, width=28)
-        search_entry.pack(side="left", padx=(6, 0))
-        search_entry.bind("<KeyRelease>", lambda _event: self.schedule_mod_search())
-        ttk.Button(filters, text="Clear", command=self.clear_mod_search).pack(side="left", padx=(6, 0))
 
-        self.tree = ttk.Treeview(right, columns=("state", "collection", "title"), show="headings")
-        self.tree.heading("state", text="State")
-        self.tree.heading("collection", text="Pack")
-        self.tree.heading("title", text="Workshop ID / Title")
-        self.tree.column("state", width=100, anchor="w")
-        self.tree.column("collection", width=90, anchor="w")
-        self.tree.column("title", width=520, anchor="w")
-        self.tree.grid(row=2, column=0, sticky="nsew")
-        tree_scroll = ttk.Scrollbar(right, orient="vertical", command=self.tree.yview)
-        tree_scroll.grid(row=2, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=tree_scroll.set)
-        self.tree.bind("<Button-3>", self.show_mod_context_menu)
-        self.mod_context_menu = tk.Menu(
-            self,
-            tearoff=False,
-            bg="#171d22",
-            fg="#eef3ef",
-            activebackground="#2d4b55",
-            activeforeground="#ffffff",
-        )
-        self.mod_context_menu.add_command(
-            label="Open Steam Workshop Page",
-            command=self.open_selected_workshop_page,
-        )
-        self.mod_context_menu.add_command(
-            label="Copy Workshop URL",
-            command=self.copy_selected_workshop_url,
-        )
+        actions = ttk.Frame(right)
+        actions.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self.selection_buttons = []
+        for label, command in (("Enable / pin", self.always_enable_selected), ("Disable", self.disable_selected), ("Use pack default", self.reset_selected)):
+            button = ttk.Button(actions, text=label, command=command, state="disabled")
+            button.pack(side="left", padx=(0, 6))
+            self.selection_buttons.append(button)
+        HoverTooltip(self.selection_buttons[0], lambda: "Always include the selected mods in your live pack. DLC and Cosmetics exclusions still apply.")
+        HoverTooltip(self.selection_buttons[1], lambda: "Always skip the selected mods in your live pack.")
+        HoverTooltip(self.selection_buttons[2], lambda: "Remove your pin or disable override and follow the current pack again.")
+        ttk.Separator(actions, orient="vertical").pack(side="left", fill="y", padx=(3, 9))
+        self.undo_button = UndoIconButton(actions, self.undo_last_mod_change)
+        self.undo_button.pack(side="left")
+        HoverTooltip(self.undo_button, lambda: self.undo_description)
+        self.bind("<Control-z>", self.undo_shortcut)
+        if sys.platform == "darwin":
+            self.bind("<Command-z>", self.undo_shortcut)
+        ttk.Button(actions, text="Apply & sort", command=self.write_config, style="Accent.TButton").pack(side="right")
+        ttk.Button(actions, text="Refresh pack", command=self.start_scan).pack(side="right", padx=(6, 8))
+
+        lists = ttk.PanedWindow(right, orient="horizontal")
+        lists.grid(row=2, column=0, sticky="nsew")
+        self.list_trees = []
+        for active, count in ((True, self.active_count), (False, self.inactive_count)):
+            panel = ttk.Frame(lists, padding=(0, 0, 6 if active else 0, 0))
+            panel.columnconfigure(0, weight=1)
+            panel.rowconfigure(2, weight=1)
+            ttk.Label(panel, textvariable=count, style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+            ttk.Label(panel, text="Next launch · sorted automatically" if active else "Not in the next launch", style="Muted.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
+            columns = ("order", "title", "state") if active else ("title", "state", "collection")
+            tree = ttk.Treeview(panel, columns=columns, show="headings", selectmode="extended")
+            for column in columns:
+                tree.heading(column, text={"order": "#", "title": "Mod name", "state": "Status", "collection": "Pack"}[column], anchor="w")
+                if not active: tree.heading(column, command=lambda key=column: self.sort_inactive_mods(key))
+                tree.column(column, width={"order": 44, "title": 260, "state": 120, "collection": 82}[column], minwidth=40, stretch=column == "title", anchor="w")
+            tree.grid(row=2, column=0, sticky="nsew")
+            scroll = ttk.Scrollbar(panel, orient="vertical", command=tree.yview)
+            scroll.grid(row=2, column=1, sticky="ns")
+            tree.configure(yscrollcommand=scroll.set)
+            horizontal = ttk.Scrollbar(panel, orient="horizontal", command=tree.xview)
+            horizontal.grid(row=3, column=0, sticky="ew")
+            tree.configure(xscrollcommand=horizontal.set)
+            for tag, color in (("missing", "#f0ad82"), ("excluded", "#99a3b5"), ("pinned", "#81cfc0"), ("game", "#b6c4d1")):
+                tree.tag_configure(tag, foreground=color)
+            tree.tag_configure("stripe", background="#19222a")
+            tree.bind("<<TreeviewSelect>>", lambda event, target=tree: self.mod_selection_changed(target))
+            tree.bind("<Button-3>", lambda event, target=tree: self.show_mod_context_menu(event, target))
+            if sys.platform == "darwin":
+                tree.bind("<Control-Button-1>", lambda event, target=tree: self.show_mod_context_menu(event, target))
+                tree.bind("<Button-2>", lambda event, target=tree: self.show_mod_context_menu(event, target))
+            tree.bind("<Return>", lambda event, target=tree: self.mod_selection_changed(target))
+            lists.add(panel, weight=1)
+            self.list_trees.append(tree)
+        self.tree, self.inactive_tree = self.list_trees
+        self.selected_tree = self.tree
+        main.add(right, weight=5)
+        self.after_idle(lambda: main.sashpos(0, 265))
+
+        footer = ttk.Frame(self, padding=(20, 0, 20, 8))
+        footer.grid(row=5, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+        self.table_title.set("Select a mod to inspect it. Ctrl+click or Shift+click selects several.")
+        ttk.Label(footer, textvariable=self.table_title, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        self.log_button = ttk.Button(footer, text="Show activity", command=self.toggle_activity)
+        self.log_button.grid(row=0, column=1, sticky="e")
+        ttk.Button(footer, text="Open logs", command=self.open_activity_logs).grid(row=0, column=2, padx=(6, 0))
+        self.log_frame = ttk.Frame(self, padding=(20, 0, 20, 12))
+        self.log_frame.columnconfigure(0, weight=1)
+        self.status = tk.Text(self.log_frame, height=6, wrap="word", state="disabled", bg="#0d1115", fg="#9fb1bd", relief="flat", padx=12, pady=8, font=("Consolas", 9))
+        self.status.grid(row=0, column=0, sticky="ew")
+        log_scroll = ttk.Scrollbar(self.log_frame, orient="vertical", command=self.status.yview)
+        log_scroll.grid(row=0, column=1, sticky="ns")
+        self.status.configure(yscrollcommand=log_scroll.set)
+        try:
+            if ACTIVITY_LOG_PATH.is_file():
+                recent = ACTIVITY_LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-150:]
+                self.status.configure(state="normal")
+                self.status.insert("end", "\n".join(recent) + "\n")
+                self.status.see("end")
+                self.status.configure(state="disabled")
+        except OSError:
+            pass
+        self.mod_context_menu = tk.Menu(self, tearoff=False, bg="#171d22", fg="#eef3ef", activebackground="#2d4b55", activeforeground="#ffffff")
+        self.mod_context_menu.add_command(label="Open Steam Workshop Page", command=self.open_selected_workshop_page)
+        self.mod_context_menu.add_command(label="Copy Workshop URL", command=self.copy_selected_workshop_url)
+        self.mod_context_menu.add_separator()
+        self.mod_context_menu.add_command(label="Enable / pin", command=self.always_enable_selected)
+        self.mod_context_menu.add_command(label="Disable", command=self.disable_selected)
+        self.mod_context_menu.add_command(label="Use pack default", command=self.reset_selected)
         self.refresh_frozen_profiles()
-        self.progress("Ready. Press Play Now for the full automatic setup, or open Advanced Options for manual controls.")
+        self.update_undo_button()
+        self.progress("Ready. Mod lists preview your next live launch. Apply & sort saves the list without launching.")
 
     def set_mod_rows(self, rows: list[tuple[str, str, str, str | None, QuarantinedMod | None]]) -> None:
         self.current_rows = rows
         self.apply_mod_filters()
 
+    @staticmethod
+    def mod_row_name(row) -> str:
+        label, item_id = row[2], row[3]
+        if item_id and label.startswith(item_id):
+            label = label[len(item_id):].strip()
+        label = re.sub(r"\s+\[[^\]]+\]$", "", label)
+        return label.split(" — requires ")[0].strip() or item_id or "Unnamed mod"
+
     def apply_mod_filters(self) -> None:
-        self.tree.delete(*self.tree.get_children())
+        selected = self.selected_item_ids()
         self.row_item_ids.clear()
         self.quarantined_rows.clear()
-        load_order_view = self.table_view.get() == "Active Load Order"
-        if load_order_view:
-            self.table_title.set("Active Load Order")
-            self.tree.heading("state", text="Order")
-            self.tree.heading("collection", text="Source")
-            self.tree.heading("title", text="Workshop ID / Mod / Package ID")
-            self.state_combo.configure(state="disabled")
-            self.pack_combo.configure(state="disabled")
-            rows = self.load_order_rows
-        else:
-            self.table_title.set("Mod Differences")
-            self.tree.heading("state", text="State")
-            self.tree.heading("collection", text="Pack")
-            self.tree.heading("title", text="Workshop ID / Title")
-            self.state_combo.configure(state="readonly")
-            self.pack_combo.configure(state="readonly")
-            rows = self.current_rows
-        state_filter = self.state_filter.get()
-        pack_filter = self.pack_filter.get()
-        search_query = self.mod_search.get().strip()
-        matched_rows: list[tuple[float, str]] = []
-        for state, collection, title, item_id, quarantined_mod in rows:
-            if not load_order_view and state_filter != "All states" and state != state_filter:
-                continue
-            if not load_order_view and pack_filter != "All packs":
-                if collection != pack_filter:
+        self.row_records.clear()
+        by_item = {row[3]: row for row in self.current_rows if row[3]}
+        active_ids = {row[3] for row in self.load_order_rows if row[3]}
+        active_rows = [(row, by_item.get(row[3])) for row in self.load_order_rows]
+        inactive_rows = [(row, row) for row in self.current_rows if row[3] not in active_ids]
+        inactive_rows.sort(key=lambda pair: (0 if pair[0][0] in {"Missing", "Needs SteamCMD"} else 1, self.mod_row_name(pair[0]).casefold()))
+        if self.inactive_sort_column != "attention":
+            inactive_rows.sort(key=lambda pair: (self.mod_row_name(pair[0]).casefold() if self.inactive_sort_column == "title" else pair[0][0 if self.inactive_sort_column == "state" else 1].casefold(), self.mod_row_name(pair[0]).casefold()), reverse=self.inactive_sort_reverse)
+        state_filter, pack_filter = self.state_filter.get(), self.pack_filter.get()
+        query = self.mod_search.get().strip()
+        tokens = query.casefold().split()
+        def search_text(row, info):
+            state, collection, label, item_id, _ = info or row
+            package = self.current_result.installed_package_ids.get(item_id, "") if self.current_result else ""
+            return " ".join((state, collection, label, item_id or "", package)).casefold()
+        has_exact = bool(tokens) and any(all(token in search_text(row, info) for token in tokens) for row, info in active_rows + inactive_rows)
+        total_visible = 0
+        for active, tree, candidates, count in ((True, self.tree, active_rows, self.active_count), (False, self.inactive_tree, inactive_rows, self.inactive_count)):
+            scroll = tree.yview()
+            old_rows = set(tree.get_children())
+            visible = []
+            for index, (row, info) in enumerate(candidates):
+                info = info or row
+                state, collection, label, item_id, quarantined = info
+                if state_filter == "Needs attention" and state not in {"Missing", "Needs SteamCMD"}:
                     continue
-            searchable_text = " ".join(
-                value
-                for value in (state, collection, title, item_id or "")
-                if value
-            )
-            search_score = mod_search_score(search_query, searchable_text)
-            if search_query and search_score < 0.5:
-                continue
-            row_id = self.tree.insert("", "end", values=(state, collection, title))
-            if search_query:
-                matched_rows.append((search_score, row_id))
+                if state_filter == "Pinned" and state != "Always Enabled":
+                    continue
+                if state_filter not in {"All states", "Needs attention", "Pinned"} and state != state_filter:
+                    continue
+                if pack_filter != "All packs" and collection != pack_filter:
+                    continue
+                if query:
+                    text = search_text(row, info)
+                    exact = all(token in text for token in tokens)
+                    if not exact and (has_exact or mod_search_score(query, text) < 0.72): continue
+                name = self.mod_row_name(row)
+                status = {"Enabled": "From pack", "Always Enabled": "Pinned", "Always Disabled": "Disabled", "Disabled": "Not in pack", "Needs SteamCMD": "Needs download", "Included in ReGrowth 2": "Merged"}.get(state, state)
+                if active and not item_id:
+                    status = "Game / DLC"
+                values = (row[0], name, status) if active else (name, status, collection)
+                identity = item_id or row[2]
+                iid = ("active:" if active else "inactive:") + identity
+                tags = ["stripe"] if len(visible) % 2 else []
+                if state in {"Missing", "Needs SteamCMD"}: tags.append("missing")
+                elif state == "DLC excluded": tags.append("excluded")
+                elif state == "Always Enabled": tags.append("pinned")
+                elif not item_id: tags.append("game")
+                if tree.exists(iid):
+                    tree.item(iid, values=values, tags=tags)
+                    tree.move(iid, "", "end")
+                else:
+                    tree.insert("", "end", iid=iid, values=values, tags=tags)
+                visible.append(iid)
+                self.row_records[iid] = info
+                if item_id: self.row_item_ids[iid] = item_id
+                if quarantined: self.quarantined_rows[iid] = quarantined
+            removed = old_rows - set(visible)
+            if removed: tree.delete(*removed)
+            restore = [iid for iid in visible if self.row_item_ids.get(iid) in selected]
+            if restore:
+                tree.selection_set(restore)
+                self.selected_tree = tree
+            if scroll: tree.yview_moveto(scroll[0])
+            prefix = "Active" if active else "Inactive & missing"
+            count.set(f"{prefix} · {len(visible):,}" + (f" / {len(candidates):,}" if len(visible) != len(candidates) else ""))
+            total_visible += len(visible)
+        self.table_title.set(f"{total_visible:,} mods shown" + (" · No matches. Clear search or filters to see more mods." if not total_visible else " · Ctrl+F to find · Ctrl/Shift+click to select several"))
+        self.mod_selection_changed(self.selected_tree)
+
+    def sort_inactive_mods(self, column: str) -> None:
+        self.inactive_sort_reverse = not self.inactive_sort_reverse if self.inactive_sort_column == column else False
+        self.inactive_sort_column = column
+        for key, label in (("title", "Mod name"), ("state", "Status"), ("collection", "Pack")):
+            self.inactive_tree.heading(key, text=label + ((" ▾" if self.inactive_sort_reverse else " ▴") if key == column else ""))
+        self.apply_mod_filters()
+
+    def mod_selection_changed(self, tree) -> None:
+        if tree is None: return
+        if not tree.selection() and tree is not self.selected_tree: return
+        if tree.selection():
+            self.selected_tree = tree
+            for other in self.list_trees:
+                if other is not tree and other.selection(): other.selection_remove(*other.selection())
+        selection = tree.selection()
+        selected = self.selected_item_ids()
+        for button in self.selection_buttons:
+            button.configure(state="normal" if selected and not self._busy else "disabled")
+        self.workshop_button.configure(state="normal" if self.selected_workshop_item_id() else "disabled")
+        item_id = self.row_item_ids.get(selection[0]) if selection else None
+        path = self.current_result.item_paths.get(item_id) if self.current_result and item_id else None
+        self.folder_button.configure(state="normal" if path and path.is_dir() else "disabled")
+        row = self.row_records.get(selection[0]) if selection else None
+        if not row:
+            self.detail_title.set("Select a mod")
+            self.detail_subtitle.set("Inspect its status and requirements")
+            content = "Active lists the sorted mods for your next launch.\n\nInactive includes extra mods, disabled mods and anything still missing.\n\nEnable / pin keeps a mod in your live pack. Use pack default removes your override."
+        else:
+            self.detail_title.set(self.mod_row_name(row))
+            state_label = "Game / DLC" if row[0].isdigit() else row[0]
+            self.detail_subtitle.set(f"{state_label} · {row[1]}" + (f" · {len(selected)} selected" if len(selected) > 1 else ""))
+            explanations = {
+                "Missing": "Required by the pack, but not installed. Play Now will try to download it.",
+                "Needs SteamCMD": "Steam has not made this copy loadable. A local download is needed.",
+                "Enabled": "Included in the live pack and ready for the next launch.",
+                "Always Enabled": "Pinned by you. Kept enabled even when it is outside the pack.",
+                "Always Disabled": "Disabled by you. Use pack default to remove this override.",
+                "Disabled": "Installed, but outside the live pack. Enable / pin to include it.",
+                "DLC excluded": "Skipped by your DLC choices, including dependent mods. Clear its Skip DLC option to include it.",
+                "Included in ReGrowth 2": "The standalone mod is already included in the installed ReGrowth 2 copy. No separate download is needed.",
+            }
+            content = explanations.get(row[0], "Official game content is kept in dependency order.")
             if item_id:
-                self.row_item_ids[row_id] = item_id
-            if quarantined_mod:
-                self.quarantined_rows[row_id] = quarantined_mod
-        if matched_rows:
-            _, best_row = max(matched_rows, key=lambda match: match[0])
-            self.tree.selection_set(best_row)
-            self.tree.focus(best_row)
-            self.tree.see(best_row)
+                content += f"\n\nID\n{item_id}"
+            if path:
+                metadata = cached_mod_metadata(path, item_id)
+                if metadata:
+                    content += f"\n\nPACKAGE\n{metadata.package_id}"
+                    deps = dependencies_for_version(metadata, scan_game_version(Path(self.local_mods_path.get()), Path(self.mods_config_path.get())))
+                    if metadata.package_id in DLC_REQUIREMENT_CORRECTIONS:
+                        deps.add(DLC_REQUIREMENT_CORRECTIONS[metadata.package_id][1])
+                    if deps: content += "\n\nREQUIRES\n" + "\n".join(DLC_PACKAGES.get(dep, dep) for dep in sorted(deps))
+                content += f"\n\nLOCATION\n{path}"
+            if self.current_result and item_id in self.current_result.dlc_exclusions:
+                content += "\n\nEXCLUDED DLC\n" + ", ".join(DLC_PACKAGES[p] for p in self.current_result.dlc_exclusions[item_id])
+        self.detail_text.configure(state="normal")
+        self.detail_text.delete("1.0", "end")
+        self.detail_text.insert("1.0", content)
+        self.detail_text.configure(state="disabled")
+
+    def open_selected_mod_folder(self) -> None:
+        selected = self.selected_item_ids()
+        if self.current_result and selected:
+            path = self.current_result.item_paths.get(next(iter(selected)))
+            if path and path.is_dir():
+                try:
+                    open_folder(path)
+                    self.progress(f"Opened mod folder: {self.mod_change_name(next(iter(selected)))} — {path}.")
+                except OSError as exc:
+                    messagebox.showerror("Could not open folder", str(exc))
+
+    def toggle_activity(self) -> None:
+        self.log_visible = not self.log_visible
+        if self.log_visible: self.log_frame.grid(row=6, column=0, sticky="ew")
+        else: self.log_frame.grid_remove()
+        self.log_button.configure(text="Hide activity" if self.log_visible else "Show activity")
+
+    def open_activity_logs(self) -> None:
+        try:
+            ACTIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            open_folder(ACTIVITY_LOG_PATH.parent)
+            self.progress("Opened the saved activity logs folder.")
+        except OSError as exc:
+            messagebox.showerror("Could not open activity logs", str(exc))
+
+    def toggle_locations(self) -> None:
+        self.locations_visible = not self.locations_visible
+        if self.locations_visible: self.paths_frame.grid()
+        else: self.paths_frame.grid_remove()
 
     def clear_mod_search(self) -> None:
         if self.mod_search_after_id is not None:
@@ -3706,44 +4246,37 @@ class ProgressorApp(tk.Tk):
         self.apply_mod_filters()
 
     def selected_item_ids(self) -> set[str]:
-        return {
-            self.row_item_ids[item]
-            for item in self.tree.selection()
-            if item in self.row_item_ids
-        }
+        tree = self.selected_tree or self.tree
+        return {self.row_item_ids[item] for item in tree.selection() if item in self.row_item_ids}
 
     def selected_workshop_item_id(self) -> str | None:
-        for row_id in self.tree.selection():
+        tree = self.selected_tree or self.tree
+        for row_id in tree.selection():
             item_id = self.row_item_ids.get(row_id)
-            if item_id:
-                return item_id
-            values = self.tree.item(row_id, "values")
-            if len(values) >= 3:
-                match = re.match(r"(\d{7,})\b", str(values[2]))
-                if match:
-                    return match.group(1)
+            if item_id and item_id.isdigit(): return item_id
         return None
 
-    def show_mod_context_menu(self, event: tk.Event) -> None:
-        row_id = self.tree.identify_row(event.y)
-        if not row_id:
-            return
-        self.tree.selection_set(row_id)
-        self.tree.focus(row_id)
+    def show_mod_context_menu(self, event: tk.Event, tree=None) -> None:
+        tree = tree or self.tree
+        row_id = tree.identify_row(event.y)
+        if not row_id: return
+        if row_id not in tree.selection(): tree.selection_set(row_id)
+        tree.focus(row_id)
+        self.mod_selection_changed(tree)
         if self.mod_context_menu is not None:
-            has_workshop_page = self.selected_workshop_item_id() is not None
-            state = "normal" if has_workshop_page else "disabled"
+            state = "normal" if self.selected_workshop_item_id() else "disabled"
             self.mod_context_menu.entryconfigure(0, state=state)
             self.mod_context_menu.entryconfigure(1, state=state)
-            try:
-                self.mod_context_menu.tk_popup(event.x_root, event.y_root)
-            finally:
-                self.mod_context_menu.grab_release()
+            action_state = "normal" if self.selected_item_ids() and not self._busy else "disabled"
+            for index in (3, 4, 5): self.mod_context_menu.entryconfigure(index, state=action_state)
+            try: self.mod_context_menu.tk_popup(event.x_root, event.y_root)
+            finally: self.mod_context_menu.grab_release()
 
     def open_selected_workshop_page(self) -> None:
         item_id = self.selected_workshop_item_id()
         if item_id:
             webbrowser.open(WORKSHOP_URL.format(id=item_id))
+            self.progress(f"Opened Workshop: {self.mod_change_name(item_id)} ({item_id}).")
 
     def copy_selected_workshop_url(self) -> None:
         item_id = self.selected_workshop_item_id()
@@ -3753,7 +4286,7 @@ class ProgressorApp(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(url)
         self.update()
-        self.progress(f"Copied Workshop URL for {item_id}.")
+        self.progress(f"Copied Workshop URL: {self.mod_change_name(item_id)} ({item_id}).")
 
     def refresh_frozen_profiles(self) -> None:
         names = frozen_profile_names()
@@ -3841,45 +4374,21 @@ class ProgressorApp(tk.Tk):
     def toggle_advanced(self) -> None:
         self.advanced_visible = not self.advanced_visible
         if self.advanced_visible:
-            self.update_idletasks()
-            self.compact_window_geometry = (self.winfo_width(), self.winfo_height())
-            if self.paths_frame is not None:
-                self.paths_frame.grid()
             self.advanced_frame.grid(row=2, column=0, sticky="ew")
-            if (
-                self.main_pane is not None
-                and self.mod_table_frame is not None
-                and str(self.mod_table_frame) not in self.main_pane.panes()
-            ):
-                self.main_pane.add(self.mod_table_frame, weight=2)
-            self.advanced_button.configure(text="Hide Advanced Options")
-            self.update_idletasks()
-            width, height = self.compact_window_geometry
-            expanded_height = min(
-                max(height + 260, self.winfo_reqheight()),
-                self.winfo_screenheight() - 70,
-            )
-            self.geometry(f"{width}x{expanded_height}")
         else:
-            if self.paths_frame is not None:
-                self.paths_frame.grid_remove()
             self.advanced_frame.grid_remove()
-            if (
-                self.main_pane is not None
-                and self.mod_table_frame is not None
-                and str(self.mod_table_frame) in self.main_pane.panes()
-            ):
-                self.main_pane.forget(self.mod_table_frame)
-            self.advanced_button.configure(text="Show Advanced Options")
-            if self.compact_window_geometry is not None:
-                width, height = self.compact_window_geometry
-                self.geometry(f"{width}x{height}")
-                self.compact_window_geometry = None
+        self.advanced_button.configure(text="Hide Advanced Options" if self.advanced_visible else "Show Advanced Options")
 
     def progress(self, message: str) -> None:
+        try:
+            line = append_activity_log(message)
+        except OSError as exc:
+            line = f"{_dt.datetime.now().strftime('%H:%M:%S')}  {message}\nActivity log could not be saved: {exc}\n"
         def append() -> None:
             self.status.configure(state="normal")
-            self.status.insert("end", f"{_dt.datetime.now().strftime('%H:%M:%S')}  {message}\n")
+            self.status.insert("end", line)
+            if int(self.status.index("end-1c").split(".")[0]) > 1200:
+                self.status.delete("1.0", "200.0")
             self.status.see("end")
             self.status.configure(state="disabled")
 
@@ -3926,7 +4435,7 @@ class ProgressorApp(tk.Tk):
     def choose_steamcmd(self) -> None:
         initial = self.steamcmd_path.get()
         initial_dir = str(Path(initial).parent) if initial else str(Path.home())
-        steamcmd_pattern = "steamcmd.sh" if sys.platform == "darwin" else "steamcmd.exe"
+        steamcmd_pattern = "steamcmd.exe" if sys.platform == "win32" else "steamcmd*"
         path = filedialog.askopenfilename(
             initialdir=initial_dir,
             filetypes=[("SteamCMD", steamcmd_pattern), ("Executables", "*"), ("All files", "*.*")],
@@ -3969,6 +4478,7 @@ class ProgressorApp(tk.Tk):
         if self.frozen_profiles_path.get() != frozen_profiles_text:
             self.frozen_profiles_path.set(frozen_profiles_text)
         try:
+            previous_settings = load_settings()
             save_settings(
                 {
                     "workshop_path": self.workshop_path.get().strip(),
@@ -3978,9 +4488,22 @@ class ProgressorApp(tk.Tk):
                     "frozen_profiles_path": frozen_profiles_text,
                     "selected_frozen_profile": self.frozen_profile.get().strip(),
                     "exclude_cosmetics": self.exclude_cosmetics.get(),
+                    "excluded_dlcs": sorted(self.selected_excluded_dlcs()),
                     "auto_update_on_launch": self.auto_update_on_launch.get(),
                 }
             )
+            current_settings = load_settings()
+            labels = {"workshop_path": "Workshop folder", "local_mods_path": "Local mods folder", "mods_config_path": "ModsConfig path",
+                      "steamcmd_path": "SteamCMD path", "frozen_profiles_path": "Frozen profiles folder", "selected_frozen_profile": "Selected frozen profile",
+                      "exclude_cosmetics": "Exclude Cosmetics", "excluded_dlcs": "Skip DLC", "auto_update_on_launch": "Auto-update on launch"}
+            for key, label in labels.items():
+                before, after = previous_settings.get(key), current_settings.get(key)
+                if before != after:
+                    def display(value):
+                        if key == "excluded_dlcs": return ", ".join(DLC_PACKAGES.get(p, p) for p in (value or [])) or "None"
+                        if isinstance(value, bool): return "On" if value else "Off"
+                        return str(value or "Not set")
+                    self.progress(f"Setting changed: {label} — {display(before)} → {display(after)}.")
         except OSError as exc:
             self.progress(f"Could not save paths: {exc}")
 
@@ -3995,6 +4518,19 @@ class ProgressorApp(tk.Tk):
         if self.current_result is not None:
             self.start_scan()
 
+    def selected_excluded_dlcs(self) -> set[str]:
+        return {package for package, variable in self.dlc_choices.items() if variable.get()}
+
+    def dlc_setting_changed(self) -> None:
+        if getattr(self, "_busy", False):
+            saved = normalize_excluded_dlcs(load_settings().get("excluded_dlcs", []))
+            for package, variable in self.dlc_choices.items():
+                variable.set(package in saved)
+            self.progress("Wait for the current operation before changing DLC exclusions.")
+            return
+        self.save_configured_paths()
+        self.load_installed_on_startup()
+
     def auto_detect_paths(self) -> None:
         self.workshop_path.set(str(default_workshop_path()))
         self.local_mods_path.set(str(default_rimworld_mods_path()))
@@ -4007,7 +4543,7 @@ class ProgressorApp(tk.Tk):
         else:
             self.progress(
                 "SteamCMD was not found. Use Install SteamCMD for automatic setup, "
-                "or select steamcmd.exe manually."
+                "or select SteamCMD manually."
             )
 
     def auto_detect_invalid_paths(self) -> None:
@@ -4048,6 +4584,9 @@ class ProgressorApp(tk.Tk):
 
     def set_busy(self, message: str) -> None:
         self._busy = True
+        self.update_undo_button()
+        for button in self.selection_buttons:
+            button.configure(state="disabled")
         self.optimize_button.configure(state="disabled")
         self.play_button.configure(state="disabled", text=message.upper())
         self.play_button.start_indeterminate()
@@ -4075,17 +4614,25 @@ class ProgressorApp(tk.Tk):
 
     def clear_busy(self) -> None:
         self._busy = False
+        self.update_undo_button()
         self.optimize_button.configure(state="normal")
+        for checkbox in self.dlc_checkbuttons:
+            checkbox.configure(state="normal")
         self.play_button.reset()
         self.busy_message.set("")
         self.play_button.configure(state="normal", text="PLAY NOW")
         self.update_quick_frozen_button()
+
+        self.mod_selection_changed(self.selected_tree)
 
     def run_busy_worker(self, message: str, target) -> None:
         if getattr(self, "_busy", False):
             self.progress("Wait for the current launcher operation to finish.")
             return
         self.set_busy(message)
+        self.progress(f"Action started: {message}")
+        for checkbox in self.dlc_checkbuttons:
+            checkbox.configure(state="disabled")
 
         def wrapped() -> None:
             try:
@@ -4103,6 +4650,7 @@ class ProgressorApp(tk.Tk):
             Path(self.mods_config_path.get()),
             progress,
             exclude_cosmetics=self.exclude_cosmetics.get(),
+            excluded_dlcs=self.selected_excluded_dlcs(),
         )
 
     def scan_paths_with_required(
@@ -4118,6 +4666,7 @@ class ProgressorApp(tk.Tk):
             Path(self.mods_config_path.get()),
             progress,
             exclude_cosmetics=self.exclude_cosmetics.get(),
+            excluded_dlcs=self.selected_excluded_dlcs(),
         )
 
     def apply_updates_before_launch(
@@ -4271,11 +4820,12 @@ class ProgressorApp(tk.Tk):
         local = Path(self.local_mods_path.get())
         config = Path(self.mods_config_path.get())
         exclude_cosmetics = self.exclude_cosmetics.get()
+        excluded_dlcs = self.selected_excluded_dlcs()
         def worker() -> None:
             try:
                 if not required:
                     raise RuntimeError("Scan Ferny's Pack before optimizing textures.")
-                result = scan_with_required(required, workshop, local, config, self.progress, exclude_cosmetics=exclude_cosmetics)
+                result = scan_with_required(required, workshop, local, config, self.progress, exclude_cosmetics=exclude_cosmetics, excluded_dlcs=excluded_dlcs)
                 log_path = run_texture_optimization(result, self.progress)
                 self.after(0, lambda: messagebox.showinfo("Textures optimized", "Texture optimization finished. You can press PLAY NOW when ready.\n\nLog: " + str(log_path)))
             except (RuntimeError, OSError) as exc:
@@ -4285,7 +4835,6 @@ class ProgressorApp(tk.Tk):
         self.run_busy_worker("Optimizing textures...", worker)
 
     def start_scan(self) -> None:
-        self.tree.delete(*self.tree.get_children())
         self.progress("Starting scan...")
 
         def worker() -> None:
@@ -4309,10 +4858,11 @@ class ProgressorApp(tk.Tk):
         local_mods = Path(self.local_mods_path.get())
         config = Path(self.mods_config_path.get())
         exclude_cosmetics = self.exclude_cosmetics.get()
+        excluded_dlcs = self.selected_excluded_dlcs()
 
         def worker() -> None:
             try:
-                result = scan_with_required(required, workshop, local_mods, config, self.progress, exclude_cosmetics=exclude_cosmetics)
+                result = scan_with_required(required, workshop, local_mods, config, self.progress, exclude_cosmetics=exclude_cosmetics, excluded_dlcs=excluded_dlcs)
                 self.current_result = result
                 self.after(0, lambda: self.render_result(result))
                 self.progress("Installed mods loaded using the saved pack list. Scan Ferny's Pack refreshes the online list.")
@@ -4359,7 +4909,7 @@ class ProgressorApp(tk.Tk):
             item_id = package_to_item.get(package_id)
             if item_id:
                 item = result.required.get(item_id)
-                metadata = read_mod_metadata(result.item_paths[item_id], item_id)
+                metadata = cached_mod_metadata(result.item_paths[item_id], item_id)
                 if item and item.title:
                     title = item.title
                 elif metadata:
@@ -4391,16 +4941,23 @@ class ProgressorApp(tk.Tk):
         result: ScanResult,
         sort_result: SortResult | None = None,
     ) -> None:
+        result.always_enabled_ids.difference_update(result.dlc_exclusions)
+        result.disabled_ids.update(result.dlc_exclusions)
+        # Reflect explicit pin/disable changes immediately, including missing rows.
+        enabled = set(result.required_order) - (result.disabled_ids - result.always_enabled_ids)
+        result.missing_ids = [item for item in result.required_order if item in enabled and item not in result.installed_ids]
+        result.unregistered_ids = [item for item in result.required_order if item in enabled and item in result.installed_ids and item not in result.ready_ids]
         sort_result = sort_result or get_or_build_sort_result(result, self.progress)
         self.current_sort_result = sort_result
         pinned_installed = result.always_enabled_ids & result.installed_ids
+        self.library_summary.set(f"{len(sort_result.package_ids):,} active · {len(result.missing_ids) + len(result.unregistered_ids):,} need download · {len(result.dlc_exclusions):,} DLC excluded")
         disabled_installed_ids = result.disabled_ids & result.installed_ids
         disabled_extra_ids = [item_id for item_id in result.extra_ids if item_id not in result.always_enabled_ids]
         self.progress(
             f"Ready: {len(result.ready_ids)} loadable, {len(result.missing_ids)} missing, "
             f"{len(result.unregistered_ids)} need SteamCMD local download, "
             f"{len(disabled_installed_ids | set(disabled_extra_ids))} disabled, "
-            f"{len(pinned_installed)} always enabled."
+            f"{len(pinned_installed)} always enabled, {len(result.dlc_exclusions)} DLC excluded."
         )
         ready_package_ids = {
             result.installed_package_ids[item_id]
@@ -4410,6 +4967,19 @@ class ProgressorApp(tk.Tk):
         }
         self.progress(f"ModsConfig writer can activate {len(ready_package_ids)} unique Ferny package IDs.")
         rows: list[tuple[str, str, str, str | None, QuarantinedMod | None]] = []
+        for item_id, dlcs in sorted(result.dlc_exclusions.items(), key=lambda item: mod_item_sort_key(item[0])):
+            item = result.dlc_excluded_items.get(item_id)
+            label = f"{item_id}  {item.title}" if item and item.title else extra_mod_label(result, item_id)
+            reason = ", ".join(DLC_PACKAGES[dlc] for dlc in dlcs)
+            source = item.collection if item else "Local" if not item_id.isdigit() else "Workshop"
+            rows.append(("DLC excluded", source, f"{label} — requires {reason} (directly or through a dependency)", item_id, None))
+        for old_id, provider_id in result.merged_items.items():
+            title = MERGED_WORKSHOP_ITEMS[old_id][0]
+            rows.append(("Included in ReGrowth 2", "Replacement", f"{title} — verified in installed ReGrowth 2 ({provider_id})", None, None))
+        for item_id in result.required_order:
+            if item_id in result.disabled_ids and item_id not in result.installed_ids and item_id not in result.always_enabled_ids:
+                item = result.required[item_id]
+                rows.append(("Always Disabled", item.collection, f"{item_id}  {item.title or 'Unavailable Workshop item'} (not installed)", item_id, None))
         for item_id in result.missing_ids:
             item = result.required[item_id]
             rows.append(("Missing", item.collection, f"{item_id}  {item.title}", item_id, None))
@@ -4417,6 +4987,8 @@ class ProgressorApp(tk.Tk):
             item = result.required[item_id]
             rows.append(("Needs SteamCMD", item.collection, f"{item_id}  {item.title}", item_id, None))
         for item_id in result.extra_ids:
+            if item_id in result.dlc_exclusions:
+                continue
             if item_id in result.always_enabled_ids:
                 state = "Always Enabled"
             elif item_id in result.disabled_ids:
@@ -4460,6 +5032,14 @@ class ProgressorApp(tk.Tk):
         if not selected:
             messagebox.showinfo("Select mods", "Select one or more mods in the table first.")
             return
+        if self.current_result:
+            blocked = selected & set(self.current_result.dlc_exclusions)
+            selected.difference_update(blocked)
+            if blocked:
+                self.progress("DLC-excluded mods stay skipped. Uncheck their Skip DLC option before enabling them.")
+            if not selected:
+                messagebox.showinfo("DLC excluded", "Uncheck the corresponding Skip DLC option before enabling this mod. Saved pins are remembered.")
+                return
         if self.exclude_cosmetics.get():
             cosmetic_selected = selected & cached_cosmetic_ids()
             selected.difference_update(cosmetic_selected)
@@ -4473,61 +5053,117 @@ class ProgressorApp(tk.Tk):
                     "Turn off Exclude Cosmetics pack before marking cosmetic mods as Always Enabled.",
                 )
                 return
-        always_enabled = load_always_enabled_ids()
-        always_enabled.update(selected)
-        save_always_enabled_ids(always_enabled)
-        disabled = load_disabled_ids()
-        disabled.difference_update(selected)
-        save_disabled_ids(disabled)
-        self.progress(f"Always enabled {len(selected)} selected mod(s).")
-        if self.current_result:
-            self.current_result.always_enabled_ids = always_enabled
-            self.current_result.disabled_ids = disabled
-            self.render_result(self.current_result)
+        self.change_mod_overrides(selected, "pinned", "Enable / pin")
 
     def disable_selected(self) -> None:
         selected = self.selected_item_ids()
         if not selected:
             messagebox.showinfo("Select mods", "Select one or more mods in the table first.")
             return
-        always_enabled = load_always_enabled_ids()
-        removed = selected & always_enabled
-        always_enabled.difference_update(selected)
-        save_always_enabled_ids(always_enabled)
-        disabled = load_disabled_ids()
-        disabled.update(selected)
-        save_disabled_ids(disabled)
-        self.progress(
-            f"Always disabled {len(selected)} selected mod(s); "
-            f"{len(removed)} removed from Always Enabled."
-        )
-        if self.current_result:
-            self.current_result.always_enabled_ids = always_enabled
-            self.current_result.disabled_ids = disabled
-            self.render_result(self.current_result)
+        self.change_mod_overrides(selected, "disabled", "Disable")
 
     def reset_selected(self) -> None:
         selected = self.selected_item_ids()
         if not selected:
             messagebox.showinfo("Select mods", "Select one or more mods in the table first.")
             return
-        always_enabled = load_always_enabled_ids()
-        disabled = load_disabled_ids()
-        enabled_overrides = selected & always_enabled
-        disabled_overrides = selected & disabled
-        always_enabled.difference_update(selected)
-        disabled.difference_update(selected)
-        save_always_enabled_ids(always_enabled)
-        save_disabled_ids(disabled)
-        self.progress(
-            f"Reset {len(selected)} selected mod(s) to Ferny's current pack status; "
-            f"removed {len(enabled_overrides)} Always Enabled and "
-            f"{len(disabled_overrides)} Always Disabled override(s)."
-        )
+        self.change_mod_overrides(selected, "default", "Use pack default")
+
+    def mod_change_name(self, item_id: str) -> str:
         if self.current_result:
-            self.current_result.always_enabled_ids = always_enabled
-            self.current_result.disabled_ids = disabled
+            item = self.current_result.required.get(item_id) or self.current_result.dlc_excluded_items.get(item_id)
+            if item and item.title: return item.title
+            path = self.current_result.item_paths.get(item_id)
+            metadata = cached_mod_metadata(path, item_id) if path else None
+            if metadata and metadata.name: return metadata.name
+        return item_id
+
+    def refresh_mod_overrides(self) -> None:
+        if self.current_result:
+            self.current_result.always_enabled_ids = load_always_enabled_ids()
+            self.current_result.disabled_ids = load_disabled_ids()
             self.render_result(self.current_result)
+        self.update_undo_button()
+
+    def change_mod_overrides(self, selected: set[str], mode: str, action: str) -> None:
+        if self._busy:
+            self.progress("Wait for the current operation before changing mods.")
+            return
+        labels = {"pinned": "Pinned", "disabled": "Disabled", "default": "Pack default"}
+        try:
+            pins, disabled = load_always_enabled_ids(), load_disabled_ids()
+            changes = []
+            for item_id in sorted(selected, key=mod_item_sort_key):
+                before = mod_override(item_id, pins, disabled)
+                name = self.mod_change_name(item_id)
+                if before == mode:
+                    self.progress(f"Manual: {name} ({item_id}) — already {labels[mode]} [{action}].")
+                    continue
+                changes.append({"item_id": item_id, "name": name, "before": before, "after": mode})
+                pins.discard(item_id)
+                disabled.discard(item_id)
+                if mode == "pinned": pins.add(item_id)
+                elif mode == "disabled": disabled.add(item_id)
+            if not changes: return
+            event = {"id": str(time.time_ns()), "time": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                     "kind": "mods", "action": action, "mods": changes}
+            commit_mod_choices(pins, disabled, event)
+            for change in changes:
+                self.progress(f"Manual: {change['name']} ({change['item_id']}) — {labels[change['before']]} → {labels[mode]} [{action}].")
+            self.refresh_mod_overrides()
+        except (OSError, ValueError) as exc:
+            self.progress(f"Could not save manual mod change: {exc}")
+            messagebox.showerror("Mod change was not saved", str(exc))
+
+    def update_undo_button(self) -> None:
+        enabled = False
+        try:
+            event = latest_undoable_change()
+            if event:
+                names = ", ".join(change["name"] for change in event["mods"][:3])
+                if len(event["mods"]) > 3: names += f" and {len(event['mods']) - 3} more"
+                self.undo_description = f"Undo {event['action']}: {names}\nCtrl+Z (⌘Z on Mac). Restores saved mod choices; Apply & sort saves the load order."
+                pins, disabled = load_always_enabled_ids(), load_disabled_ids()
+                enabled = all(mod_override(change["item_id"], pins, disabled) == change["after"] for change in event["mods"])
+                if not enabled: self.undo_description = "Saved choices changed since the last action. Undo is unavailable to avoid overwriting them."
+            else:
+                self.undo_description = "No manual mod changes to undo."
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.undo_description = f"Undo history could not be read: {exc}"
+        self.undo_button.set_enabled(enabled and not self._busy)
+
+    def undo_shortcut(self, _event=None):
+        if isinstance(self.focus_get(), (ttk.Entry, tk.Entry, tk.Text)):
+            return None
+        self.undo_last_mod_change()
+        return "break"
+
+    def undo_last_mod_change(self) -> None:
+        if self._busy: return
+        labels = {"pinned": "Pinned", "disabled": "Disabled", "default": "Pack default"}
+        try:
+            event = latest_undoable_change()
+            if not event: return
+            pins, disabled = load_always_enabled_ids(), load_disabled_ids()
+            if any(mod_override(change["item_id"], pins, disabled) != change["after"] for change in event["mods"]):
+                self.progress("Undo skipped: saved choices changed since that action; nothing was overwritten.")
+                self.update_undo_button()
+                return
+            for change in event["mods"]:
+                item_id = change["item_id"]
+                pins.discard(item_id)
+                disabled.discard(item_id)
+                if change["before"] == "pinned": pins.add(item_id)
+                elif change["before"] == "disabled": disabled.add(item_id)
+            undo = {"id": str(time.time_ns()), "time": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "kind": "undo", "target": event["id"], "action": "Undo " + event["action"], "mods": event["mods"]}
+            commit_mod_choices(pins, disabled, undo)
+            for change in event["mods"]:
+                self.progress(f"Undo: {change['name']} ({change['item_id']}) — {labels[change['after']]} → {labels[change['before']] }.")
+            self.refresh_mod_overrides()
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.progress(f"Undo failed: {exc}")
+            messagebox.showerror("Could not undo mod change", str(exc))
 
     def freeze_current_setup(self) -> None:
         if rimworld_is_running():
@@ -4789,7 +5425,7 @@ class ProgressorApp(tk.Tk):
             )
             return
         try:
-            os.startfile(profile_path)
+            open_folder(profile_path)
             self.progress(f"Opened frozen profile folder: {profile_path}")
         except OSError as exc:
             messagebox.showerror("Could not open folder", str(exc))
@@ -4800,7 +5436,7 @@ class ProgressorApp(tk.Tk):
         if not quarantines:
             messagebox.showinfo("No quarantine", "No .progressor_quarantine folders were found.")
             return
-        os.startfile(quarantines[0])
+        open_folder(quarantines[0])
 
     def quarantine_extra(self) -> None:
         result = self.current_result
@@ -4829,7 +5465,7 @@ class ProgressorApp(tk.Tk):
         self.run_busy_worker("Quarantining mods...", worker)
 
     def restore_selected_quarantine(self) -> None:
-        selected = [self.quarantined_rows[item] for item in self.tree.selection() if item in self.quarantined_rows]
+        selected = [self.quarantined_rows[item] for item in (self.selected_tree or self.tree).selection() if item in self.quarantined_rows]
         if not selected:
             messagebox.showinfo("Select quarantined mods", "Click Show Quarantine, select one or more quarantined mods, then restore.")
             return
@@ -5110,8 +5746,8 @@ class ProgressorApp(tk.Tk):
 
 
 def main() -> int:
-    if sys.platform not in {"win32", "darwin"}:
-        print("Progression Launcher supports Windows and macOS right now. Other OSes may need manual setup.")
+    if sys.platform not in {"win32", "darwin", "linux"}:
+        print("Progression Launcher supports Windows, macOS and Linux. Other OSes may need manual setup.")
     acquired, existing_processes = acquire_single_instance()
     if not acquired:
         show_single_instance_warning(existing_processes)
