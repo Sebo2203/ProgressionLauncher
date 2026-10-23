@@ -2,7 +2,7 @@
 
 Download the **x86_64** archive, extract it, and run `ProgressionLauncher/ProgressionLauncher` inside the extracted folder. Keep the executable and its `_internal` folder together.
 
-This is an experimental build, built on Ubuntu 22.04. Other distributions and SteamOS still need real game-launch testing. On Steam Deck, use desktop mode.
+This is an experimental build, built on Ubuntu 24.04. Other distributions and SteamOS still need real game-launch testing. On Steam Deck, use desktop mode.
 
 SteamCMD needs your distribution's 32-bit runtime libraries, commonly `lib32gcc-s1` and `lib32stdc++6` on Debian/Ubuntu. Folder actions use `xdg-open`. The launcher can install its own SteamCMD copy without root, but it does not install system packages. Flatpak permissions may require manually selecting paths.
 
