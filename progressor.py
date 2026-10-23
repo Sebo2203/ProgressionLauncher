@@ -30,7 +30,7 @@ import tkinter as tk
 
 APP_ID = "294100"
 APP_NAME = "Progression Launcher"
-APP_VERSION = "0.4.6"
+APP_VERSION = "0.4.7"
 COLLECTIONS = {
     "Core": "3521297585",
     "Content": "3521319712",
@@ -3131,6 +3131,49 @@ def stable_topological_sort(nodes: list[str], edges: list[tuple[str, str]]) -> t
     return ordered, broken_edges
 
 
+def load_them_last_settings(result: ScanResult, active_package_ids, game_version: str) -> tuple[str, list[str]]:
+    """Read the active mod's version fallback exactly as its startup hook does."""
+    if "ferny.loadthemlast" not in active_package_ids:
+        return "", []
+    mod_path = next((result.item_paths[item_id] for item_id, package in result.installed_package_ids.items()
+                     if package == "ferny.loadthemlast" and item_id in result.item_paths
+                     and item_id not in result.dlc_exclusions
+                     and ((item_id in result.ready_ids and item_id not in result.disabled_ids)
+                          or (item_id in result.always_enabled_ids and item_id in result.installed_ids))), None)
+    if mod_path is None:
+        return "", []
+    current = re.match(r"(\d+)\.(\d+)", game_version)
+    if current is None:
+        raise RuntimeError("Cannot determine the game version for Load Them Last. Scan again before launching.")
+    target = tuple(map(int, current.groups()))
+    try:
+        candidates = []
+        for child in mod_path.iterdir():
+            if child.is_dir() and re.fullmatch(r"\d+\.\d+(?:\.\d+){0,2}", child.name):
+                version = tuple(map(int, child.name.split(".")))
+                if version[:2] <= target and (child / "Settings.xml").is_file():
+                    candidates.append((version + (-1,) * (4 - len(version)), child / "Settings.xml"))
+        if not candidates:
+            return "", []
+        settings_path = max(candidates, key=lambda pair: pair[0])[1]
+        data = settings_path.read_bytes()
+        root = ET.fromstring(data)
+    except (OSError, ET.ParseError) as exc:
+        raise RuntimeError(f"Cannot read Load Them Last settings before launch: {exc}") from exc
+    packages = ["".join(node.itertext()).strip() for node in root.findall(".//loadLast/li")
+                if "".join(node.itertext())]
+    signature = str(settings_path) + ":" + hashlib.sha256(data).hexdigest()
+    return signature, packages
+
+
+def apply_load_last_order(package_ids: list[str], load_last: list[str]) -> list[str]:
+    # Match the mod's remove/append operation, without activating absent mods.
+    tail = set(load_last)
+    return [package for package in package_ids if package not in tail] + [
+        package for package in load_last if package in package_ids
+    ]
+
+
 def build_vanilla_sorted_active_list(result: ScanResult) -> SortResult:
     ludeon_mods = [package for package in existing_ludeon_active_mods(result.mods_config_path) if package not in result.excluded_dlcs]
     existing_order = existing_active_mods(result.mods_config_path)
@@ -3214,6 +3257,8 @@ def build_vanilla_sorted_active_list(result: ScanResult) -> SortResult:
                 load_rule_edges += 1
 
     sorted_package_ids, broken_edges = stable_topological_sort(base_order, edges)
+    _, load_last = load_them_last_settings(result, active_set, game_version)
+    sorted_package_ids = apply_load_last_order(sorted_package_ids, load_last)
     return SortResult(
         package_ids=sorted_package_ids,
         metadata_count=len(metadata),
@@ -3258,6 +3303,12 @@ def sort_cache_key(result: ScanResult) -> str:
     except OSError:
         config_digest = ""
     payload = {
+        "sort_schema": 2,
+        "game_version": scan_game_version(result.local_mods_path, result.mods_config_path),
+        "load_them_last_settings": load_them_last_settings(
+            result, {result.installed_package_ids.get(item, "") for item in active_item_ids},
+            scan_game_version(result.local_mods_path, result.mods_config_path),
+        )[0],
         "excluded_dlcs": sorted(result.excluded_dlcs),
         "dlc_exclusions": sorted(result.dlc_exclusions),
         "required_order": result.required_order,

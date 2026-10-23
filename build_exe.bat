@@ -20,7 +20,7 @@ if not exist "%DIST%" mkdir "%DIST%"
   --clean ^
   --onefile ^
   --windowed ^
-  --name "ProgressionLauncher-v0.4.6" ^
+  --name "ProgressionLauncher-v0.4.7" ^
   --add-data "%APP_DIR%\progression_logo.png;." ^
   --add-data "%APP_DIR%\collection_cache.json;." ^
   --add-data "%APP_DIR%\todds;todds" ^
@@ -30,5 +30,5 @@ if not exist "%DIST%" mkdir "%DIST%"
   progressor.py
 
 echo.
-echo Built: %DIST%\ProgressionLauncher-v0.4.6.exe
+echo Built: %DIST%\ProgressionLauncher-v0.4.7.exe
 pause

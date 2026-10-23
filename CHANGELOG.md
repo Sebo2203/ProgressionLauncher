@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.7
+
+- Respect Load Them Last's mod order before launch to avoid an unnecessary RimWorld restart.
+
 ## 0.4.6
 
 - Use known replacements for retired Workshop mods automatically.

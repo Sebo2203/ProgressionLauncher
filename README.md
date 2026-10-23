@@ -2,11 +2,11 @@
 
 Windows, macOS and Linux helper for launching Ferny's Progression RimWorld modpack.
 
-[**Download Progression Launcher v0.4.6 for Windows**](https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.6/ProgressionLauncher-v0.4.6.exe)
+[**Download Progression Launcher v0.4.7 for Windows**](https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.7/ProgressionLauncher-v0.4.7.exe)
 
-[**Download for macOS (Apple Silicon or Intel, test builds)**](https://github.com/Sebo2203/ProgressionLauncher/releases/tag/v0.4.6-macos-test)
+[**Download for macOS (Apple Silicon or Intel, test builds)**](https://github.com/Sebo2203/ProgressionLauncher/releases/tag/v0.4.7-macos-test)
 
-[**Download for Linux x86_64 (experimental)**](https://github.com/Sebo2203/ProgressionLauncher/releases/tag/v0.4.6-linux-test)
+[**Download for Linux x86_64 (experimental)**](https://github.com/Sebo2203/ProgressionLauncher/releases/tag/v0.4.7-linux-test)
 
 The [download page](https://sebo2203.github.io/ProgressionLauncher/) lists all three platforms. Mac and Linux packages are built and checked on native GitHub runners before publication. See [MAC_TESTER.md](MAC_TESTER.md) and [LINUX_TESTER.md](LINUX_TESTER.md) for tester instructions.
 
@@ -94,11 +94,9 @@ Search both lists by name, Workshop ID, or package ID (`Ctrl+F`; `Escape` clears
 
 When frozen profiles exist, the selected profile is also available directly beneath `PLAY NOW`. The launcher remembers that selection between restarts. Hover over the adjacent `?` for a summary of the difference between live and frozen play.
 
-## What is new in v0.4.6
+## What is new in v0.4.7
 
-- Use known replacements for retired Workshop mods automatically.
-- Choose whether to skip unavailable mods and continue, with undo available.
-- Remove the duplicate pack scan button from Advanced options.
+- Respect Load Them Last's mod order before launch to avoid an unnecessary RimWorld restart.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history. Existing frozen profiles are unchanged.
 
@@ -217,7 +215,7 @@ build_exe.bat
 The built app appears at:
 
 ```text
-dist\ProgressionLauncher-v0.4.6.exe
+dist\ProgressionLauncher-v0.4.7.exe
 ```
 
 To build a macOS app bundle on a Mac:
