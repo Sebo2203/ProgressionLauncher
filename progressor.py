@@ -30,7 +30,7 @@ import tkinter as tk
 
 APP_ID = "294100"
 APP_NAME = "Progression Launcher"
-APP_VERSION = "0.4.5"
+APP_VERSION = "0.4.6"
 COLLECTIONS = {
     "Core": "3521297585",
     "Content": "3521319712",
@@ -43,6 +43,18 @@ MERGED_WORKSHOP_ITEMS = {
     "2545774148": ("ReGrowth 2: Aspen", "2260097569", "regrowth.botr.core"),
 }
 
+# Retired uploads whose corresponding editions are already curated into the pack,
+# plus the author's Mighty-Liver re-upload. No title-based guesses or version gate.
+WORKSHOP_REPLACEMENTS = {
+    "3226502149": ("[KV] Call Trade Ships [1.6 Patched]", "3513064727", "PATCHED 1.7 Call Trade Ships", "wecardo.calltradeships"),
+    "3798550797": ("StarFix - Continued", "3778487830", "StarFix", "guppyfacesarecute.starfix"),
+    "3798550391": ("Better Vomit - Continued", "3309016770", "Better Vomit", "guppyfacesarecute.bettervomit"),
+    "3798549519": ("Skunks - Continued", "3775906812", "Skunks", "guppyfacesarecute.skunks"),
+    "3626568306": ("[Temp] AFU Men's hairstyles", "2072106893", "AFU Men's hairstyles", "jintuzilamian.hairstyle.afumenshairstyles"),
+    "3626568203": ("[Temp] AFU Women's hairstyles", "2020779666", "AFU Women's hairstyles", "jintuzilamian.hairstyle.afuwomenshairstyles"),
+    "3628433732": ("Mighty-Liver Tweak for Det's Xenotypes - Stoneborn", "3667792009", "Mighty-Liver Tweak for Det's Xenotypes - Stoneborn", "xubisca.mightylivertweak"),
+}
+
 DLC_PACKAGES = {
     "ludeon.rimworld.royalty": "Royalty",
     "ludeon.rimworld.ideology": "Ideology",
@@ -52,6 +64,7 @@ DLC_PACKAGES = {
 }
 # Missing requirements reported by the pack's users. Match IDs, never title keywords.
 DLC_REQUIREMENT_CORRECTIONS = {
+    "xubisca.mightylivertweak": ("3667792009", "ludeon.rimworld.biotech"),
     "cf.odysseyupscaled2x": ("3535506453", "ludeon.rimworld.odyssey"),
     "local.wtlodysseyquestfilter": ("3807578618", "ludeon.rimworld.odyssey"),
     "as1aw.morehunterdrones": ("3532453334", "ludeon.rimworld.odyssey"),
@@ -304,6 +317,9 @@ class ScanResult:
     excluded_dlcs: set[str] = field(default_factory=set)
     dlc_exclusions: dict[str, tuple[str, ...]] = field(default_factory=dict)
     dlc_excluded_items: dict[str, WorkshopItem] = field(default_factory=dict)
+    replaced_items: dict[str, str] = field(default_factory=dict)
+    replacement_titles: dict[str, str] = field(default_factory=dict)
+    replacement_packages: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -2056,6 +2072,45 @@ def verified_aspen_provider(mod_path: Path, config_path: Path, local_mods_path: 
     return False
 
 
+def resolve_workshop_replacements(required, package_ids, ready_ids, always_enabled, disabled,
+                                  mod_roots, progress):
+    replaced, titles, expected = {}, {}, {}
+    for old, (title, new, new_title, package) in WORKSHOP_REPLACEMENTS.items():
+        if old not in required or old in always_enabled:
+            continue
+        item = required.pop(old)
+        required.setdefault(new, WorkshopItem(item.collection, new, new_title))
+        replaced[old], titles[old], expected[old] = new, title, package
+        progress(f"Replacement: {title} ({old}) → {new_title} ({new}).")
+    # Once an item has been read, its package ID can connect it to another
+    # loadable entry selected by the current pack. This also handles future forks.
+    roots = {root.resolve() for root in mod_roots}
+    remembered = {}
+    for path_text, entry in load_local_metadata_cache().items():
+        path = Path(path_text)
+        if len(path.parents) < 3 or path.parents[2].resolve() not in roots:
+            continue
+        item_id = path.parents[1].name
+        metadata = entry.get("metadata", {}) if isinstance(entry, dict) else {}
+        if item_id in required and (item_id not in ready_ids or not package_ids.get(item_id)) and metadata.get("package_id"):
+            remembered[item_id] = metadata
+    by_package = {}
+    for item_id in required:
+        if item_id in ready_ids and (item_id not in disabled or item_id in always_enabled):
+            package = package_ids.get(item_id, "").lower()
+            if package: by_package.setdefault(package, item_id)
+    for old, metadata in remembered.items():
+        if old in always_enabled or old in disabled: continue
+        package = str(metadata["package_id"]).lower()
+        new = by_package.get(package)
+        if not new or new == old: continue
+        item = required.pop(old)
+        title = item.title or metadata.get("name") or old
+        replaced[old], titles[old], expected[old] = new, title, package
+        progress(f"Package match: {title} ({old}) is supplied by the pack's installed item {new} [{package}].")
+    return replaced, titles, expected
+
+
 def scan_with_required(
     required_snapshot: dict[str, WorkshopItem],
     workshop_path: Path,
@@ -2102,6 +2157,9 @@ def scan_with_required(
     always_enabled_ids = load_always_enabled_ids()
     disabled_ids = load_disabled_ids()
     disabled_ids.difference_update(always_enabled_ids)
+    replaced_items, replacement_titles, replacement_packages = resolve_workshop_replacements(
+        required, package_ids, ready_ids, always_enabled_ids, disabled_ids,
+        (workshop_path, local_mods_path), progress)
     excluded_dlcs = normalize_excluded_dlcs(excluded_dlcs)
     dlc_exclusions = dlc_excluded_mods(required, item_paths, excluded_dlcs,
                                     scan_game_version(local_mods_path, mods_config_path), (workshop_path, local_mods_path))
@@ -2152,6 +2210,9 @@ def scan_with_required(
         excluded_dlcs=excluded_dlcs,
         dlc_exclusions=dlc_exclusions,
         dlc_excluded_items=dlc_excluded_items,
+        replaced_items=replaced_items,
+        replacement_titles=replacement_titles,
+        replacement_packages=replacement_packages,
     )
 
 
@@ -2758,8 +2819,18 @@ def unavailable_workshop_message(result: ScanResult, item_ids: list[str]) -> str
         "Repeating the same download will not resolve this response. Restore a complete trusted copy "
         "or check the modpack author's replacement instructions. Other missing mods are not automatically skipped."
     )
-    lines.append("To deliberately exclude an unavailable mod, select it in the table and choose Always Disable Selected. Review save and dependency compatibility first.")
+    lines.append("Use the unavailable-mod review to skip these entries, or select them in the table and choose Disable. Skipping is saved and can be undone.")
     return "\n".join(lines)
+
+
+class UnavailableWorkshopItems(RuntimeError):
+    def __init__(self, result: ScanResult, item_ids: list[str]):
+        self.item_ids = item_ids
+        super().__init__(unavailable_workshop_message(result, item_ids))
+
+
+class SetupCancelled(RuntimeError):
+    pass
 
 
 def run_steamcmd_downloads(
@@ -2776,7 +2847,7 @@ def run_steamcmd_downloads(
     unavailable: set[str] = set()
     fetch_remote_update_times(targets, progress, unavailable_out=unavailable)
     if unavailable:
-        raise RuntimeError(unavailable_workshop_message(result, [item for item in targets if item in unavailable]))
+        raise UnavailableWorkshopItems(result, [item for item in targets if item in unavailable])
     steamcmd = find_or_install_steamcmd(progress)
     total = len(targets)
     completed_ids: set[str] = set()
@@ -2858,7 +2929,7 @@ def run_steamcmd_downloads(
 
     error_detected = execute_batches(targets)
     if unavailable:
-        raise RuntimeError(unavailable_workshop_message(result, [item for item in targets if item in unavailable]))
+        raise UnavailableWorkshopItems(result, [item for item in targets if item in unavailable])
     if error_detected:
         loadable = loadable_ids(targets)
         retry_ids = [
@@ -3249,6 +3320,13 @@ def get_or_build_sort_result(result: ScanResult, progress=None) -> SortResult:
 
 
 def verify_merged_replacements(result: ScanResult) -> None:
+    for old_id, new_id in result.replaced_items.items():
+        if new_id in result.dlc_exclusions or (new_id in result.disabled_ids and new_id not in result.always_enabled_ids):
+            continue
+        path = result.item_paths.get(new_id)
+        metadata = read_mod_metadata(path, new_id) if path else None
+        if new_id not in result.ready_ids or metadata is None or metadata.package_id.lower() != result.replacement_packages[old_id]:
+            raise RuntimeError(f"Replacement for {result.replacement_titles[old_id]} is missing or changed. Download and scan again before applying the mod list.")
     for old_id, provider_id in result.merged_items.items():
         provider = result.item_paths.get(provider_id)
         if (provider is None or provider_id not in result.ready_ids
@@ -3497,6 +3575,44 @@ class HoverTooltip:
         if self.window is not None:
             self.window.destroy()
             self.window = None
+
+
+class UnavailableModsDialog(tk.Toplevel):
+    def __init__(self, parent, rows):
+        super().__init__(parent)
+        self.title("Unavailable Workshop items")
+        self.transient(parent)
+        self.configure(bg="#101418")
+        self.result = False
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+        self.geometry("760x390")
+        self.minsize(600, 340)
+        ttk.Label(self, text="Some collection entries are unavailable", style="Title.TLabel").grid(row=0, column=0, sticky="w", padx=20, pady=(20, 10))
+        ttk.Label(self, text="Known replacements have already been applied. You can skip the entries below to continue.\nExisting saves may depend on them. This choice is saved and can be undone with the undo arrow.", wraplength=700).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 12))
+        table = ttk.Treeview(self, columns=("name", "id"), show="headings", height=5)
+        table.heading("name", text="Unavailable mod", anchor="w")
+        table.heading("id", text="Workshop ID", anchor="w")
+        table.column("name", width=460)
+        table.column("id", width=150, stretch=False)
+        table.grid(row=2, column=0, sticky="nsew", padx=(20, 34))
+        scroll = ttk.Scrollbar(self, orient="vertical", command=table.yview)
+        scroll.grid(row=2, column=0, sticky="nse", padx=(0, 20))
+        table.configure(yscrollcommand=scroll.set)
+        for name, item_id in rows: table.insert("", "end", values=(name, item_id))
+        buttons = ttk.Frame(self, padding=20)
+        buttons.grid(row=3, column=0, sticky="ew")
+        cancel = ttk.Button(buttons, text="Cancel setup", command=self.destroy)
+        cancel.pack(side="left")
+        ttk.Button(buttons, text="Skip listed mods and continue", command=self.accept, style="Accent.TButton").pack(side="right")
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.grab_set()
+        cancel.focus_set()
+
+    def accept(self):
+        self.result = True
+        self.destroy()
 
 
 class UndoIconButton(tk.Canvas):
@@ -3852,7 +3968,6 @@ class ProgressorApp(tk.Tk):
         ttk.Button(paths, text="Auto Detect Paths", command=self.auto_detect_paths).grid(row=5, column=2, sticky="e", padx=(8, 0), pady=(8, 0))
         toolbar = ttk.Frame(self.advanced_frame)
         toolbar.grid(row=1, column=0, sticky="ew")
-        ttk.Button(toolbar, text="Scan Ferny's Pack", command=self.start_scan).pack(side="left")
         ttk.Button(toolbar, text="Download Missing", command=self.download_missing).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Check Mod Updates", command=self.update_steamcmd_mods).pack(side="left", padx=6)
         self.optimize_button = ttk.Button(toolbar, text="Optimize Textures", command=self.optimize_textures)
@@ -3953,7 +4068,7 @@ class ProgressorApp(tk.Tk):
         self.bind("<Control-f>", lambda _event: self.search_entry.focus_set())
         if sys.platform == "darwin":
             self.bind("<Command-f>", lambda _event: self.search_entry.focus_set())
-        self.state_combo = ttk.Combobox(filters, textvariable=self.state_filter, values=("All states", "Needs attention", "Pinned", "DLC excluded", "Missing", "Needs SteamCMD", "Always Disabled", "Disabled"), state="readonly", width=18)
+        self.state_combo = ttk.Combobox(filters, textvariable=self.state_filter, values=("All states", "Needs attention", "Pinned", "DLC excluded", "Missing", "Needs SteamCMD", "Always Disabled", "Disabled", "Replaced"), state="readonly", width=18)
         self.state_combo.grid(row=0, column=3, padx=(12, 0))
         self.state_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_mod_filters())
         self.pack_combo = ttk.Combobox(filters, textvariable=self.pack_filter, values=("All packs", "Core", "Content", "Cosmetics", "Local", "Workshop", "Game"), state="readonly", width=12)
@@ -4159,7 +4274,8 @@ class ProgressorApp(tk.Tk):
             button.configure(state="normal" if selected and not self._busy else "disabled")
         self.workshop_button.configure(state="normal" if self.selected_workshop_item_id() else "disabled")
         item_id = self.row_item_ids.get(selection[0]) if selection else None
-        path = self.current_result.item_paths.get(item_id) if self.current_result and item_id else None
+        provider_id = self.current_result.replaced_items.get(item_id, item_id) if self.current_result else item_id
+        path = self.current_result.item_paths.get(provider_id) if self.current_result and provider_id else None
         self.folder_button.configure(state="normal" if path and path.is_dir() else "disabled")
         row = self.row_records.get(selection[0]) if selection else None
         if not row:
@@ -4179,10 +4295,13 @@ class ProgressorApp(tk.Tk):
                 "Disabled": "Installed, but outside the live pack. Enable / pin to include it.",
                 "DLC excluded": "Skipped by your DLC choices, including dependent mods. Clear its Skip DLC option to include it.",
                 "Included in ReGrowth 2": "The standalone mod is already included in the installed ReGrowth 2 copy. No separate download is needed.",
+                "Replaced": "This retired Workshop upload is supplied by a corresponding edition in the live pack. Mod actions apply to that edition.",
             }
             content = explanations.get(row[0], "Official game content is kept in dependency order.")
             if item_id:
                 content += f"\n\nID\n{item_id}"
+            if provider_id and provider_id != item_id:
+                content += f"\n\nREPLACEMENT\n{provider_id}"
             if path:
                 metadata = cached_mod_metadata(path, item_id)
                 if metadata:
@@ -4247,12 +4366,14 @@ class ProgressorApp(tk.Tk):
 
     def selected_item_ids(self) -> set[str]:
         tree = self.selected_tree or self.tree
-        return {self.row_item_ids[item] for item in tree.selection() if item in self.row_item_ids}
+        ids = {self.row_item_ids[item] for item in tree.selection() if item in self.row_item_ids}
+        return {self.current_result.replaced_items.get(item, item) for item in ids} if self.current_result else ids
 
     def selected_workshop_item_id(self) -> str | None:
         tree = self.selected_tree or self.tree
         for row_id in tree.selection():
             item_id = self.row_item_ids.get(row_id)
+            if self.current_result: item_id = self.current_result.replaced_items.get(item_id, item_id)
             if item_id and item_id.isdigit(): return item_id
         return None
 
@@ -4741,6 +4862,46 @@ class ProgressorApp(tk.Tk):
             self.progress("Pre-launch update check found no updates.")
         return result
 
+    def review_unavailable_items(self, result: ScanResult, item_ids: list[str]) -> bool:
+        done = threading.Event()
+        decision = {"accepted": False}
+        def ask():
+            try:
+                self.current_result = result
+                self.render_result(result)
+                rows = []
+                for item_id in item_ids:
+                    name = self.mod_change_name(item_id)
+                    rows.append((name if name != item_id else "Unidentified Workshop item", item_id))
+                dialog = UnavailableModsDialog(self, rows)
+                self.wait_window(dialog)
+                if dialog.result:
+                    decision["accepted"] = self.change_mod_overrides(set(item_ids), "disabled", "Skip unavailable mods", allow_busy=True)
+                else:
+                    self.progress("Unavailable-mod review cancelled; saved mod choices were unchanged.")
+            finally:
+                done.set()
+        self.after(0, ask)
+        done.wait()
+        return decision["accepted"]
+
+    def download_with_unavailable_review(self, result: ScanResult, required_snapshot) -> ScanResult:
+        while True:
+            try:
+                run_steamcmd_downloads(result, self.progress, progress_count=self.update_busy_download_progress)
+            except UnavailableWorkshopItems as exc:
+                self.progress(f"Review needed: Steam cannot supply {len(exc.item_ids)} collection entry/entries.")
+                if not self.review_unavailable_items(result, exc.item_ids):
+                    raise SetupCancelled("Setup cancelled before changing the game configuration or launching.")
+                result = self.scan_paths_with_required(required_snapshot, self.progress)
+                remaining = download_target_ids(result)
+                if any(item in remaining for item in exc.item_ids):
+                    raise RuntimeError("Skipped items are still download targets. Scan again before continuing.")
+                if not remaining: return result
+            else:
+                self.progress("Download complete. Rechecking local folders against the same pack snapshot...")
+                return self.scan_paths_with_required(required_snapshot, self.progress)
+
     def advanced_launch(self) -> None:
         # Both live launch buttons must apply pins, even with auto-update off.
         self.play_now()
@@ -4771,13 +4932,7 @@ class ProgressorApp(tk.Tk):
                 pending_downloads = download_target_ids(result)
                 if pending_downloads:
                     self.progress(f"{len(pending_downloads)} mods need SteamCMD local download. Downloading...")
-                    run_steamcmd_downloads(
-                        result,
-                        self.progress,
-                        progress_count=self.update_busy_download_progress,
-                    )
-                    self.progress("Download complete. Rechecking local folders against the same live pack snapshot...")
-                    result = self.scan_paths_with_required(required_snapshot, self.progress)
+                    result = self.download_with_unavailable_review(result, required_snapshot)
 
                 if result.missing_ids:
                     self.current_result = result
@@ -4797,6 +4952,8 @@ class ProgressorApp(tk.Tk):
                 self.after(0, lambda: self.render_result(result, sort_result))
                 self.progress("Launching RimWorld through Steam...")
                 webbrowser.open(STEAM_RUN_RIMWORLD)
+            except SetupCancelled as exc:
+                self.progress(str(exc))
             except (RuntimeError, OSError, urllib.error.URLError) as exc:
                 self.progress(f"Play Now failed: {exc}")
                 error = str(exc)
@@ -4824,7 +4981,7 @@ class ProgressorApp(tk.Tk):
         def worker() -> None:
             try:
                 if not required:
-                    raise RuntimeError("Scan Ferny's Pack before optimizing textures.")
+                    raise RuntimeError("Refresh pack before optimizing textures.")
                 result = scan_with_required(required, workshop, local, config, self.progress, exclude_cosmetics=exclude_cosmetics, excluded_dlcs=excluded_dlcs)
                 log_path = run_texture_optimization(result, self.progress)
                 self.after(0, lambda: messagebox.showinfo("Textures optimized", "Texture optimization finished. You can press PLAY NOW when ready.\n\nLog: " + str(log_path)))
@@ -4852,7 +5009,7 @@ class ProgressorApp(tk.Tk):
     def load_installed_on_startup(self) -> None:
         required = load_collection_cache()
         if not required:
-            self.progress("Use Scan Ferny's Pack to load the mod list.")
+            self.progress("Use Refresh pack to load the mod list.")
             return
         workshop = Path(self.workshop_path.get())
         local_mods = Path(self.local_mods_path.get())
@@ -4865,7 +5022,7 @@ class ProgressorApp(tk.Tk):
                 result = scan_with_required(required, workshop, local_mods, config, self.progress, exclude_cosmetics=exclude_cosmetics, excluded_dlcs=excluded_dlcs)
                 self.current_result = result
                 self.after(0, lambda: self.render_result(result))
-                self.progress("Installed mods loaded using the saved pack list. Scan Ferny's Pack refreshes the online list.")
+                self.progress("Installed mods loaded using the saved pack list. Refresh pack updates the online list.")
             except (RuntimeError, OSError) as exc:
                 self.progress(f"Could not load installed mods: {exc}")
 
@@ -4976,6 +5133,9 @@ class ProgressorApp(tk.Tk):
         for old_id, provider_id in result.merged_items.items():
             title = MERGED_WORKSHOP_ITEMS[old_id][0]
             rows.append(("Included in ReGrowth 2", "Replacement", f"{title} — verified in installed ReGrowth 2 ({provider_id})", None, None))
+        for old_id, new_id in result.replaced_items.items():
+            title = result.replacement_titles[old_id]
+            rows.append(("Replaced", "Replacement", title, old_id, None))
         for item_id in result.required_order:
             if item_id in result.disabled_ids and item_id not in result.installed_ids and item_id not in result.always_enabled_ids:
                 item = result.required[item_id]
@@ -4987,7 +5147,7 @@ class ProgressorApp(tk.Tk):
             item = result.required[item_id]
             rows.append(("Needs SteamCMD", item.collection, f"{item_id}  {item.title}", item_id, None))
         for item_id in result.extra_ids:
-            if item_id in result.dlc_exclusions:
+            if item_id in result.dlc_exclusions or item_id in result.replaced_items:
                 continue
             if item_id in result.always_enabled_ids:
                 state = "Always Enabled"
@@ -5085,10 +5245,10 @@ class ProgressorApp(tk.Tk):
             self.render_result(self.current_result)
         self.update_undo_button()
 
-    def change_mod_overrides(self, selected: set[str], mode: str, action: str) -> None:
-        if self._busy:
+    def change_mod_overrides(self, selected: set[str], mode: str, action: str, *, allow_busy=False) -> bool:
+        if self._busy and not allow_busy:
             self.progress("Wait for the current operation before changing mods.")
-            return
+            return False
         labels = {"pinned": "Pinned", "disabled": "Disabled", "default": "Pack default"}
         try:
             pins, disabled = load_always_enabled_ids(), load_disabled_ids()
@@ -5104,16 +5264,18 @@ class ProgressorApp(tk.Tk):
                 disabled.discard(item_id)
                 if mode == "pinned": pins.add(item_id)
                 elif mode == "disabled": disabled.add(item_id)
-            if not changes: return
+            if not changes: return True
             event = {"id": str(time.time_ns()), "time": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
                      "kind": "mods", "action": action, "mods": changes}
             commit_mod_choices(pins, disabled, event)
             for change in changes:
                 self.progress(f"Manual: {change['name']} ({change['item_id']}) — {labels[change['before']]} → {labels[mode]} [{action}].")
             self.refresh_mod_overrides()
+            return True
         except (OSError, ValueError) as exc:
             self.progress(f"Could not save manual mod change: {exc}")
             messagebox.showerror("Mod change was not saved", str(exc))
+            return False
 
     def update_undo_button(self) -> None:
         enabled = False
@@ -5676,13 +5838,9 @@ class ProgressorApp(tk.Tk):
                 old_env = os.environ.get("STEAMCMD")
                 if steamcmd:
                     os.environ["STEAMCMD"] = steamcmd
-                run_steamcmd_downloads(
-                    result,
-                    self.progress,
-                    progress_count=self.update_busy_download_progress,
-                )
-                self.progress("Download complete. Rechecking local folders against the current pack snapshot...")
-                fresh_result = self.scan_paths_with_required(result.required, self.progress)
+                snapshot = dict(load_collection_cache())
+                snapshot.update(result.required)
+                fresh_result = self.download_with_unavailable_review(result, snapshot)
                 sort_result = get_or_build_sort_result(fresh_result, self.progress)
                 if self.auto_activate_after_download.get():
                     if fresh_result.missing_ids:
@@ -5697,6 +5855,8 @@ class ProgressorApp(tk.Tk):
                 self.current_result = fresh_result
                 self.current_sort_result = sort_result
                 self.after(0, lambda: self.render_result(fresh_result, sort_result))
+            except SetupCancelled as exc:
+                self.progress(str(exc))
             except (RuntimeError, OSError) as exc:
                 self.progress(f"Download failed: {exc}")
                 error = str(exc)

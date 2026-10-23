@@ -92,6 +92,18 @@ with tempfile.TemporaryDirectory() as temp:
         ui.undo_last_mod_change()
         assert not app.load_always_enabled_ids() and not app.load_disabled_ids()
         assert not ui.undo_button.enabled
+        ui._busy = True
+        pins_before = app.load_always_enabled_ids()
+        with patch.object(ui, 'after', side_effect=lambda delay, callback: callback()), patch.object(ui, 'wait_window', side_effect=lambda dialog: dialog.destroy()):
+            assert not ui.review_unavailable_items(ui.current_result, ['9999999999'])
+        assert app.load_always_enabled_ids() == pins_before and not app.load_disabled_ids()
+        with patch.object(ui, 'after', side_effect=lambda delay, callback: callback()), patch.object(ui, 'wait_window', side_effect=lambda dialog: dialog.accept()):
+            assert ui.review_unavailable_items(ui.current_result, ['9999999999'])
+        assert app.load_disabled_ids() == {'9999999999'}
+        assert app.latest_undoable_change()['action'] == 'Skip unavailable mods'
+        ui._busy = False
+        ui.undo_last_mod_change()
+        assert not app.load_disabled_ids(), 'Skipping an unavailable item is undoable'
         ui.change_mod_overrides({'10000001', '10000002'}, 'pinned', 'Enable / pin')
         assert len(app.latest_undoable_change()['mods']) == 2, 'Multi-selection is one undo action'
         app.save_always_enabled_ids({'10000001', '10000002', '77777777'})
@@ -119,6 +131,21 @@ with tempfile.TemporaryDirectory() as temp:
         ui.update()
         log = app.ACTIVITY_LOG_PATH.read_text(encoding='utf-8')
         assert 'Extra Local Mod (10000004)' in log and 'Pinned → Disabled' in log and 'Undo:' in log
+        replacement_snapshot = dict(required)
+        replacement_snapshot['77777778'] = app.WorkshopItem('Core', '77777778', 'Retired Harmony upload')
+        with patch.dict(app.WORKSHOP_REPLACEMENTS, {'77777778': ('Retired Harmony upload', '10000001', 'Harmony', 'test.mod10000001')}, clear=True):
+            replacement_result = app.scan_with_required(replacement_snapshot, workshop, local, config, lambda _: None)
+            ui.current_result = replacement_result
+            ui.render_result(replacement_result)
+            ui.inactive_tree.selection_set('inactive:77777778')
+            ui.mod_selection_changed(ui.inactive_tree)
+            assert ui.selected_item_ids() == {'10000001'} and ui.selected_workshop_item_id() == '10000001'
+            ui.always_enable_selected()
+            assert app.load_always_enabled_ids() == {'10000001'}, 'Replacement rows must act on the current edition'
+            ui.reset_selected()
+            assert not app.load_always_enabled_ids()
+        ui.current_result = result
+        ui.render_result(result)
         ui.mod_search.set('nothingmatchesxyz')
         ui.apply_mod_filters()
         assert not ui.tree.get_children() and not ui.inactive_tree.get_children()

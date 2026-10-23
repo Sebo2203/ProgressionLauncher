@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.6
+
+- Use known replacements for retired Workshop mods automatically.
+- Let players skip unavailable mods and continue, with undo available.
+- Remove the duplicate pack scan button from Advanced options.
+
 ## 0.4.5
 
 - Refresh the interface with active/inactive mod lists, clearer filters, and mod details.
