@@ -79,7 +79,12 @@ with tempfile.TemporaryDirectory() as temp:
     missing = scan(unknown_snapshot)
     class Harness:
         download_with_unavailable_review = app.ProgressorApp.download_with_unavailable_review
-        def __init__(self, approve): self.approve = approve; self.reviews = []
+        def __init__(self, approve):
+            self.approve = approve
+            self.reviews = []
+            self.activity_open = False
+        def after(self, delay, callback): callback()
+        def show_activity(self): self.activity_open = True
         def progress(self, *args): pass
         def update_busy_download_progress(self, *args): pass
         def review_unavailable_items(self, result, ids):
@@ -92,6 +97,7 @@ with tempfile.TemporaryDirectory() as temp:
         try: cancelled.download_with_unavailable_review(missing, unknown_snapshot)
         except app.SetupCancelled: pass
         else: raise AssertionError('Cancel must stop setup')
+        assert cancelled.activity_open, 'Download review must open Activity even if cancelled'
         assert not app.load_disabled_ids()
         approved = Harness(True)
         ready = approved.download_with_unavailable_review(missing, unknown_snapshot)

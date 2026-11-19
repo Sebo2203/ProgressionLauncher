@@ -156,7 +156,9 @@ with tempfile.TemporaryDirectory() as temp:
         ui.toggle_advanced()
         ui.toggle_advanced()
         assert ui.main_pane.panes() == panes, 'Mod library stays available when settings are closed'
-        ui.toggle_activity()
+        ui.show_activity()
+        ui.show_activity()
+        assert ui.log_visible and ui.log_frame.winfo_manager() == "grid"
         ui.toggle_activity()
         assert not ui.log_visible
         ui.geometry('1280x680')

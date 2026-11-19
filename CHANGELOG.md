@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.8
+
+- Open Activity automatically for downloads and show the current mod, completed count, and updates during long waits.
+- Keep SteamCMD in the background on Windows.
+- Speed up Play Now by checking fewer items, grouping downloads, and skipping redundant file work.
+
 ## 0.4.7
 
 - Respect Load Them Last's mod order before launch to avoid an unnecessary RimWorld restart.

@@ -3,6 +3,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('progressor_live_launch', Path(__file__).resolve().parents[1] / 'progressor.py')
@@ -90,4 +91,32 @@ with tempfile.TemporaryDirectory() as temp:
         Harness(result, False).advanced_launch()
         launch.assert_not_called()
         assert config.read_bytes() == before
+    app.write_mods_config(result, lambda _: None)
+    with patch.object(app, 'backup_file', side_effect=AssertionError('Identical config should not be backed up')):
+        app.write_mods_config(result, lambda _: None)
+
+    mixed = SimpleNamespace(required_order=['101', '102', '103', '104'],
+                            local_steamcmd_ids={'101', '104'}, disabled_ids={'104'},
+                            always_enabled_ids=set(), missing_ids=['102'], unregistered_ids=[])
+    ui = SimpleNamespace(
+        progress=lambda _: None, after=lambda _, fn: fn(),
+        show_activity=lambda: None, steamcmd_path=SimpleNamespace(set=lambda _: None),
+        save_configured_paths=lambda: None, update_busy_check_progress=lambda *_: None,
+        update_busy_download_progress=lambda *_: None, scan_paths_with_required=lambda *_: mixed,
+    )
+    with patch.object(app, 'fetch_remote_update_times', side_effect=[{'101': 2}, {'102': 2}]) as check, \
+         patch.object(app, 'find_or_install_steamcmd', return_value=root / 'steamcmd'), \
+         patch.object(app, 'workshop_outdated_ids', return_value=(['101'], [])), \
+         patch.object(app, 'reuse_current_workshop_copies', return_value=[]), \
+         patch.object(app, 'parse_steamcmd_update_times', return_value={'101': 1}), \
+         patch.object(app, 'run_steamcmd_downloads') as downloads:
+        app.ProgressorApp.apply_updates_before_launch(ui, mixed, {})
+        assert [call.args[0] for call in check.call_args_list] == [['101'], ['102']]
+        downloads.assert_called_once()
+        assert downloads.call_args.kwargs['targets'] == ['101', '102']
+
+        check.side_effect = [{'101': 2}, {}]
+        downloads.reset_mock()
+        app.ProgressorApp.apply_updates_before_launch(ui, mixed, {})
+        assert downloads.call_args.kwargs['targets'] == ['101'], 'Unknown missing mod must keep its separate review path'
 print('Both live launch buttons apply and verify pins with auto-update on/off; failures block launch; running game remains untouched.')

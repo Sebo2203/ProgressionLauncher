@@ -4,9 +4,11 @@ import datetime as _dt
 import concurrent.futures
 import difflib
 import hashlib
+import heapq
 import json
 import os
 import plistlib
+import queue
 import re
 import shutil
 import stat
@@ -30,7 +32,7 @@ import tkinter as tk
 
 APP_ID = "294100"
 APP_NAME = "Progression Launcher"
-APP_VERSION = "0.4.7"
+APP_VERSION = "0.4.8"
 COLLECTIONS = {
     "Core": "3521297585",
     "Content": "3521319712",
@@ -711,6 +713,7 @@ def rimworld_is_running() -> bool:
                 text=True,
                 errors="replace",
                 timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             return "RimWorld" in result.stdout
         if sys.platform in {"darwin", "linux"}:
@@ -763,6 +766,7 @@ def fetch_remote_update_times(
     update_times: dict[str, int] = {}
     unavailable_ids = unavailable_out if unavailable_out is not None else set()
     requested_ids = list(dict.fromkeys(item_ids))
+    requested = set(requested_ids)
     total = len(requested_ids)
 
     def report_count() -> None:
@@ -772,29 +776,26 @@ def fetch_remote_update_times(
         if progress_count is not None:
             progress_count(checked, total)
 
-    def fetch_batches(pending_ids: list[str], batch_size: int, retry_number: int = 0) -> None:
-        for index in range(0, len(pending_ids), batch_size):
-            batch = pending_ids[index : index + batch_size]
-            params = {"itemcount": str(len(batch))}
-            for batch_index, item_id in enumerate(batch):
-                params[f"publishedfileids[{batch_index}]"] = item_id
-            label = "Retrying" if retry_number else "Checking"
-            checked = len(set(update_times) | unavailable_ids)
-            progress(
-                f"{label} Steam metadata for {len(batch)} mod(s); "
-                f"{max(total - checked, 0)} left to check."
-            )
-            try:
-                published_response = post_steam_api(PUBLISHED_FILE_DETAILS_URL, params)
-            except urllib.error.URLError as exc:
-                progress(f"Steam metadata request failed for this batch: {exc}")
-                continue
+    def fetch_batch(batch: list[str]) -> dict | urllib.error.URLError:
+        params = {"itemcount": str(len(batch))}
+        for index, item_id in enumerate(batch):
+            params[f"publishedfileids[{index}]"] = item_id
+        try:
+            return post_steam_api(PUBLISHED_FILE_DETAILS_URL, params)
+        except urllib.error.URLError as exc:
+            return exc
+
+    def record_batch(published_response: dict | urllib.error.URLError) -> None:
+            if isinstance(published_response, urllib.error.URLError):
+                progress(f"Steam metadata request failed for this batch: {published_response}")
+                return
             file_details = published_response.get("response", {}).get("publishedfiledetails", [])
             for detail in file_details:
                 item_id = str(detail.get("publishedfileid", ""))
+                if item_id not in requested:
+                    continue
                 if int(detail.get("result", 0)) != 1:
-                    if item_id in requested_ids:
-                        unavailable_ids.add(item_id)
+                    unavailable_ids.add(item_id)
                     continue
                 raw_time = detail.get("time_updated") or detail.get("timeupdated") or 0
                 try:
@@ -802,10 +803,18 @@ def fetch_remote_update_times(
                 except (TypeError, ValueError):
                     continue
             report_count()
-            time.sleep(0.2)
 
     report_count()
-    fetch_batches(requested_ids, 100)
+    if requested_ids:
+        progress(f"Checking Steam metadata for {total} mod(s).")
+        batches = [requested_ids[i:i + 100] for i in range(0, total, 100)]
+        if len(batches) == 1:
+            record_batch(fetch_batch(batches[0]))
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [executor.submit(fetch_batch, batch) for batch in batches]
+                for future in concurrent.futures.as_completed(futures):
+                    record_batch(future.result())
     for retry_number, batch_size in enumerate((25, 10), start=1):
         missing_ids = [
             item_id
@@ -819,7 +828,10 @@ def fetch_remote_update_times(
             f"retrying in batches of {batch_size}."
         )
         time.sleep(0.8 * retry_number)
-        fetch_batches(missing_ids, batch_size, retry_number)
+        for index in range(0, len(missing_ids), batch_size):
+            if index:
+                time.sleep(0.2)
+            record_batch(fetch_batch(missing_ids[index:index + batch_size]))
     report_count()
     return update_times
 
@@ -841,6 +853,8 @@ def fetch_collection_items_api(
     collection_name: str,
     collection_id: str,
     cached_items: dict[str, WorkshopItem] | None = None,
+    *,
+    refresh_titles: bool = True,
 ) -> list[WorkshopItem]:
     collection_response = post_steam_api(
         COLLECTION_DETAILS_URL,
@@ -861,7 +875,10 @@ def fetch_collection_items_api(
     items: list[WorkshopItem] = []
     cached_items = cached_items or {}
     titles: dict[str, str] = {}
-    batches = [child_ids[index : index + 100] for index in range(0, len(child_ids), 100)]
+    title_ids = child_ids if refresh_titles else [
+        item_id for item_id in child_ids if item_id not in cached_items or not cached_items[item_id].title
+    ]
+    batches = [title_ids[index : index + 100] for index in range(0, len(title_ids), 100)]
 
     def fetch_title_batch(batch: list[str]) -> dict[str, str]:
         params = {"itemcount": str(len(batch))}
@@ -876,10 +893,15 @@ def fetch_collection_items_api(
                 batch_titles[item_id] = str(detail.get("title", "")).strip()
         return batch_titles
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(fetch_title_batch, batch) for batch in batches]
-        for future in concurrent.futures.as_completed(futures):
-            titles.update(future.result())
+    if batches:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(fetch_title_batch, batch) for batch in batches]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    titles.update(future.result())
+                except urllib.error.URLError:
+                    # Collection membership is already known. Titles are display metadata.
+                    pass
 
     for item_id in child_ids:
         title = titles.get(item_id, "")
@@ -1697,14 +1719,14 @@ def load_frozen_manifest(profile_name: str) -> dict:
         raise RuntimeError(f"Frozen profile manifest could not be read: {exc}")
 
 
-def fetch_required_items(progress) -> dict[str, WorkshopItem]:
+def fetch_required_items(progress, *, refresh_titles: bool = True) -> dict[str, WorkshopItem]:
     required: dict[str, WorkshopItem] = {}
     cached = load_collection_cache()
     try:
         def fetch_collection(entry: tuple[str, str]) -> tuple[str, list[WorkshopItem]]:
             name, collection_id = entry
             progress(f"Fetching {name} collection via Steam API...")
-            return name, fetch_collection_items_api(name, collection_id, cached)
+            return name, fetch_collection_items_api(name, collection_id, cached, refresh_titles=refresh_titles)
 
         fetched: dict[str, list[WorkshopItem]] = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(COLLECTIONS)) as executor:
@@ -1720,8 +1742,9 @@ def fetch_required_items(progress) -> dict[str, WorkshopItem]:
             items = fetched[name]
             for item in items:
                 required[item.item_id] = item
-        progress("Fetched live Workshop metadata; cache is reserved for missing titles or Steam outages.")
-        save_collection_cache(required)
+        progress("Fetched live Workshop collection membership.")
+        if not CACHE_PATH.exists() or list(required.values()) != list(cached.values()):
+            save_collection_cache(required)
         return required
     except Exception as api_error:
         progress(f"Steam API fetch failed: {api_error}")
@@ -1737,7 +1760,6 @@ def fetch_required_items(progress) -> dict[str, WorkshopItem]:
             for item in items:
                 required[item.item_id] = item
             progress(f"{name}: {len(items)} items")
-            time.sleep(1.0)
         save_collection_cache(required)
         return required
     except Exception as html_error:
@@ -1839,10 +1861,10 @@ def save_local_metadata_cache() -> None:
 def cached_mod_metadata(mod_dir: Path, item_id: str) -> ModMetadata | None:
     global _local_metadata_cache_dirty, _local_metadata_cache_hits
     about_path = mod_dir / "About" / "About.xml"
-    if not about_path.exists():
-        return None
     try:
         stat = about_path.stat()
+    except FileNotFoundError:
+        return None
     except OSError:
         return read_mod_metadata(mod_dir, item_id)
     signature = [stat.st_mtime_ns, stat.st_size]
@@ -1990,13 +2012,19 @@ def dlc_excluded_mods(required: dict[str, WorkshopItem], item_paths: dict[str, P
     # Unknown first-time downloads are checked on the mandatory post-download scan.
     remembered = {}
     roots = {path.resolve() for path in mod_roots}
+    parent_matches: dict[Path, bool] = {}
     for path_text, entry in load_local_metadata_cache().items():
         path = Path(path_text)
-        if len(path.parents) < 3 or path.parents[2].resolve() not in roots:
+        if len(path.parents) < 3:
             continue
         item_id = path.parents[1].name
         record = entry.get("metadata") if isinstance(entry, dict) else None
         if item_id not in required or not isinstance(record, dict):
+            continue
+        parent = path.parents[2]
+        if parent not in parent_matches:
+            parent_matches[parent] = parent.resolve() in roots
+        if not parent_matches[parent]:
             continue
         signature = entry.get("signature", [0])[0]
         if signature < remembered.get(item_id, (0, None))[0]:
@@ -2086,14 +2114,19 @@ def resolve_workshop_replacements(required, package_ids, ready_ids, always_enabl
     # loadable entry selected by the current pack. This also handles future forks.
     roots = {root.resolve() for root in mod_roots}
     remembered = {}
+    pending = set(required) - (ready_ids & package_ids.keys()) - always_enabled - disabled
     for path_text, entry in load_local_metadata_cache().items():
+        if not pending:
+            break
         path = Path(path_text)
-        if len(path.parents) < 3 or path.parents[2].resolve() not in roots:
+        if len(path.parents) < 3:
             continue
         item_id = path.parents[1].name
         metadata = entry.get("metadata", {}) if isinstance(entry, dict) else {}
-        if item_id in required and (item_id not in ready_ids or not package_ids.get(item_id)) and metadata.get("package_id"):
+        if item_id in pending and metadata and metadata.get("package_id") and path.parents[2].resolve() in roots:
             remembered[item_id] = metadata
+    if not remembered:
+        return replaced, titles, expected
     by_package = {}
     for item_id in required:
         if item_id in ready_ids and (item_id not in disabled or item_id in always_enabled):
@@ -2771,6 +2804,7 @@ def prepare_steamcmd_local_download_root(steamcmd_root: Path, local_mods_path: P
             capture_output=True,
             text=True,
             errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         if completed.returncode != 0:
             details = (completed.stdout + "\n" + completed.stderr).strip()
@@ -2833,11 +2867,83 @@ class SetupCancelled(RuntimeError):
     pass
 
 
+def steamcmd_log_updates(positions: dict[Path, int]) -> list[str]:
+    """Read bounded diagnostic updates when Steam buffers its console output."""
+    messages = []
+    for path, position in list(positions.items()):
+        try:
+            with path.open("rb") as handle:
+                size = handle.seek(0, os.SEEK_END)
+                if size < position:
+                    position = 0  # Steam rotated or truncated the log.
+                handle.seek(max(position, size - 65536))
+                data = handle.read()
+                positions[path] = handle.tell()
+            for line in data.decode("utf-8", errors="replace").splitlines():
+                if any(word in line.lower() for word in (
+                    "download item", "downloaded", "downloading", "validation",
+                    "download rate", "download complete", "failed", "timeout",
+                )):
+                    messages.append(line)
+        except OSError:
+            continue
+    return messages[-8:]
+
+
+def steamcmd_output_events(process, heartbeat_seconds: float = 5.0):
+    """Drain output without blocking status updates when SteamCMD is quiet."""
+    events = queue.Queue(maxsize=256)
+    finished = object()
+    stopped = threading.Event()
+
+    def deliver(value):
+        while not stopped.is_set():
+            try:
+                events.put(value, timeout=0.2)
+                return
+            except queue.Full:
+                pass
+
+    def read_output():
+        try:
+            for line in process.stdout:
+                deliver(line)
+        except Exception as exc:
+            deliver(exc)
+        finally:
+            deliver(finished)
+
+    threading.Thread(target=read_output, daemon=True).start()
+    try:
+        while True:
+            try:
+                event = events.get(timeout=heartbeat_seconds)
+            except queue.Empty:
+                yield None
+                continue
+            if event is finished:
+                while process.poll() is None:
+                    try:
+                        process.wait(timeout=heartbeat_seconds)
+                        break
+                    except subprocess.TimeoutExpired:
+                        yield None
+                break
+            elif isinstance(event, Exception):
+                raise OSError(f"Could not read SteamCMD output: {event}") from event
+            else:
+                yield event
+    finally:
+        stopped.set()
+
+
 def run_steamcmd_downloads(
     result: ScanResult,
     progress,
     targets: list[str] | None = None,
     progress_count=None,
+    *,
+    checked_update_times: dict[str, int] | None = None,
 ) -> Path:
     targets = targets or download_target_ids(result)
     if not targets:
@@ -2845,7 +2951,10 @@ def run_steamcmd_downloads(
 
     targets = list(dict.fromkeys(targets))
     unavailable: set[str] = set()
-    fetch_remote_update_times(targets, progress, unavailable_out=unavailable)
+    checked_ids = checked_update_times or {}
+    unchecked = [item_id for item_id in targets if item_id not in checked_ids]
+    if unchecked:
+        fetch_remote_update_times(unchecked, progress, unavailable_out=unavailable)
     if unavailable:
         raise UnavailableWorkshopItems(result, [item for item in targets if item in unavailable])
     steamcmd = find_or_install_steamcmd(progress)
@@ -2887,6 +2996,13 @@ def run_steamcmd_downloads(
                 handle.write("\n".join(script_lines))
                 script_path = Path(handle.name)
             try:
+                log_positions = {}
+                for log_name in ("content_log.txt", "workshop_log.txt"):
+                    log_path = steamcmd_root / "logs" / log_name
+                    try:
+                        log_positions[log_path] = log_path.stat().st_size
+                    except OSError:
+                        log_positions[log_path] = 0
                 process = subprocess.Popen(
                     [str(steamcmd), "+runscript", str(script_path)],
                     cwd=str(steamcmd_root),
@@ -2894,15 +3010,50 @@ def run_steamcmd_downloads(
                     stderr=subprocess.STDOUT,
                     text=True,
                     errors="replace",
+                    **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
                 )
                 assert process.stdout is not None
-                for line in process.stdout:
+                started = last_output = current_started = time.monotonic()
+                current_item = ""
+                last_report = ""
+                for line in steamcmd_output_events(process):
+                    now = time.monotonic()
+                    if line is None:
+                        for update in steamcmd_log_updates(log_positions):
+                            progress(f"SteamCMD: {update}")
+                            last_report = update
+                            requested = re.search(r"Download item\s+(\d+)\s+requested", update, re.IGNORECASE)
+                            if requested and requested.group(1) in batch and requested.group(1) != current_item:
+                                current_item = requested.group(1)
+                                current_started = now
+                        elapsed = int(now - started)
+                        quiet = int(now - last_output)
+                        if current_item:
+                            item = result.required.get(current_item)
+                            name = item.title if item and item.title else current_item
+                            activity = f"{name} ({current_item}), {int(now - current_started)}s on this mod"
+                        else:
+                            activity = last_report or "Connecting / preparing downloads"
+                        progress(f"SteamCMD: {activity} — {len(completed_ids)}/{total} complete; "
+                                 f"batch elapsed {elapsed // 60}:{elapsed % 60:02d}; no output for {quiet}s. "
+                                 "Process is running; waiting for Steam.")
+                        continue
+                    last_output = now
                     line = line.strip()
+                    if not line:
+                        continue
                     upper_line = line.upper()
                     failure_markers = ("ERROR!", "FAILED", "FAILURE", "NO CONNECTION", "TIMED OUT", "TIMEOUT")
                     line_failed = any(marker in upper_line for marker in failure_markers)
-                    if "SUCCESS. DOWNLOADED ITEM" in upper_line or line_failed:
-                        progress(line)
+                    progress(f"SteamCMD: {line}")
+                    downloading = re.search(r"Downloading item\s+(\d+)", line, re.IGNORECASE)
+                    if downloading and downloading.group(1) in batch:
+                        current_item = downloading.group(1)
+                        current_started = now
+                        item = result.required.get(current_item)
+                        name = item.title if item and item.title else current_item
+                        progress(f"SteamCMD: Downloading {name} ({current_item}) — "
+                                 f"{len(completed_ids)}/{total} complete.")
                     if line_failed:
                         detected_error = True
                         item_match = re.search(r"\bitem\s+(\d+)\b", line, re.IGNORECASE)
@@ -2913,6 +3064,8 @@ def run_steamcmd_downloads(
                     match = re.search(r"Success\.\s+Downloaded item\s+(\d+)", line, re.IGNORECASE)
                     if match and match.group(1) in targets and match.group(1) not in completed_ids:
                         completed_ids.add(match.group(1))
+                        if match.group(1) == current_item:
+                            current_item = ""
                         report_count()
                 return_code = process.wait()
                 if return_code != 0:
@@ -3114,20 +3267,23 @@ def stable_topological_sort(nodes: list[str], edges: list[tuple[str, str]]) -> t
             incoming_count[after] += 1
 
     remaining = set(nodes)
+    available = [(priority[node], node) for node in remaining if incoming_count[node] == 0]
+    heapq.heapify(available)
     ordered: list[str] = []
     broken_edges = 0
     while remaining:
-        available = [package_id for package_id in remaining if incoming_count[package_id] == 0]
         if not available:
-            chosen = min(remaining, key=lambda package_id: priority.get(package_id, 10**9))
+            chosen = min(remaining, key=priority.__getitem__)
             broken_edges += incoming_count[chosen]
             incoming_count[chosen] = 0
         else:
-            chosen = min(available, key=lambda package_id: priority.get(package_id, 10**9))
+            _, chosen = heapq.heappop(available)
         remaining.remove(chosen)
         ordered.append(chosen)
         for after in outgoing[chosen]:
             incoming_count[after] -= 1
+            if incoming_count[after] == 0 and after in remaining:
+                heapq.heappush(available, (priority[after], after))
     return ordered, broken_edges
 
 
@@ -3206,11 +3362,13 @@ def build_vanilla_sorted_active_list(result: ScanResult) -> SortResult:
     ]
 
     base_order: list[str] = []
+    in_base_order: set[str] = set()
 
     def add_base(package_id: str) -> None:
         package_id = package_id.lower()
-        if package_id in active_set and package_id not in base_order:
+        if package_id in active_set and package_id not in in_base_order:
             base_order.append(package_id)
+            in_base_order.add(package_id)
 
     inserted_pre_core = False
     for package_id in [*existing_order, *ludeon_mods]:
@@ -3302,12 +3460,13 @@ def sort_cache_key(result: ScanResult) -> str:
         config_digest = hashlib.sha256(result.mods_config_path.read_bytes()).hexdigest()
     except OSError:
         config_digest = ""
+    game_version = scan_game_version(result.local_mods_path, result.mods_config_path)
     payload = {
         "sort_schema": 2,
-        "game_version": scan_game_version(result.local_mods_path, result.mods_config_path),
+        "game_version": game_version,
         "load_them_last_settings": load_them_last_settings(
             result, {result.installed_package_ids.get(item, "") for item in active_item_ids},
-            scan_game_version(result.local_mods_path, result.mods_config_path),
+            game_version,
         )[0],
         "excluded_dlcs": sorted(result.excluded_dlcs),
         "dlc_exclusions": sorted(result.dlc_exclusions),
@@ -3401,10 +3560,6 @@ def write_mods_config(
     if not sort_result.package_ids:
         raise RuntimeError("No installed Workshop package IDs were found. Download the missing mods first, then scan again.")
 
-    progress("Backing up ModsConfig.xml...")
-    result.mods_config_path.parent.mkdir(parents=True, exist_ok=True)
-    backup_file(result.mods_config_path)
-
     root = ET.Element("ModsConfigData")
     version = ET.SubElement(root, "version")
     version.text = existing_config_version(result.mods_config_path)
@@ -3419,7 +3574,18 @@ def write_mods_config(
 
     tree = ET.ElementTree(root)
     ET.indent(tree, space="\t")
-    tree.write(result.mods_config_path, encoding="utf-8", xml_declaration=True)
+    config_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    try:
+        unchanged = result.mods_config_path.read_bytes() == config_bytes
+    except FileNotFoundError:
+        unchanged = False
+    if unchanged:
+        progress("ModsConfig.xml already matches the prepared load order.")
+        return result.mods_config_path
+    progress("Backing up ModsConfig.xml...")
+    result.mods_config_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_file(result.mods_config_path)
+    result.mods_config_path.write_bytes(config_bytes)
     save_cached_sort_result(result, sort_result)
     progress(
         "Wrote "
@@ -3975,6 +4141,7 @@ class ProgressorApp(tk.Tk):
             quick,
             textvariable=self.busy_message,
             foreground="#f2b35d",
+            wraplength=850,
         ).grid(row=3, column=0, sticky="w", pady=(4, 0))
         self.advanced_button = ttk.Button(quick, text="Show Advanced Options", command=self.toggle_advanced)
         self.advanced_button.grid(row=2, column=1, sticky="e", padx=(12, 0), pady=(8, 0))
@@ -4254,7 +4421,8 @@ class ProgressorApp(tk.Tk):
         total_visible = 0
         for active, tree, candidates, count in ((True, self.tree, active_rows, self.active_count), (False, self.inactive_tree, inactive_rows, self.inactive_count)):
             scroll = tree.yview()
-            old_rows = set(tree.get_children())
+            old_children = tree.get_children()
+            old_rows = set(old_children)
             visible = []
             for index, (row, info) in enumerate(candidates):
                 info = info or row
@@ -4283,9 +4451,8 @@ class ProgressorApp(tk.Tk):
                 elif state == "DLC excluded": tags.append("excluded")
                 elif state == "Always Enabled": tags.append("pinned")
                 elif not item_id: tags.append("game")
-                if tree.exists(iid):
+                if iid in old_rows:
                     tree.item(iid, values=values, tags=tags)
-                    tree.move(iid, "", "end")
                 else:
                     tree.insert("", "end", iid=iid, values=values, tags=tags)
                 visible.append(iid)
@@ -4294,6 +4461,8 @@ class ProgressorApp(tk.Tk):
                 if quarantined: self.quarantined_rows[iid] = quarantined
             removed = old_rows - set(visible)
             if removed: tree.delete(*removed)
+            if old_children != tuple(visible):
+                tree.set_children("", *visible)
             restore = [iid for iid in visible if self.row_item_ids.get(iid) in selected]
             if restore:
                 tree.selection_set(restore)
@@ -4385,6 +4554,10 @@ class ProgressorApp(tk.Tk):
         if self.log_visible: self.log_frame.grid(row=6, column=0, sticky="ew")
         else: self.log_frame.grid_remove()
         self.log_button.configure(text="Hide activity" if self.log_visible else "Show activity")
+
+    def show_activity(self) -> None:
+        if not self.log_visible:
+            self.toggle_activity()
 
     def open_activity_logs(self) -> None:
         try:
@@ -4557,6 +4730,8 @@ class ProgressorApp(tk.Tk):
         except OSError as exc:
             line = f"{_dt.datetime.now().strftime('%H:%M:%S')}  {message}\nActivity log could not be saved: {exc}\n"
         def append() -> None:
+            if self._busy and message.startswith("SteamCMD: "):
+                self.busy_message.set(message[len("SteamCMD: "):])
             self.status.configure(state="normal")
             self.status.insert("end", line)
             if int(self.status.index("end-1c").split(".")[0]) > 1200:
@@ -4846,70 +5021,70 @@ class ProgressorApp(tk.Tk):
         result: ScanResult,
         required_snapshot: dict[str, WorkshopItem],
     ) -> ScanResult:
-        local_targets = steamcmd_update_target_ids(result)
-        workshop_targets = steam_workshop_update_target_ids(result)
-        all_targets = list(dict.fromkeys([*local_targets, *workshop_targets]))
-        if not all_targets:
-            self.progress("No installed mods are available for update comparison.")
+        local_targets = [
+            item_id for item_id in steamcmd_update_target_ids(result)
+            if item_id not in result.disabled_ids or item_id in result.always_enabled_ids
+        ]
+        if not local_targets:
+            self.progress("No enabled SteamCMD mods need an update check. Steam manages subscribed mods.")
             return result
 
         self.progress(
-            f"Pre-launch update check: {len(local_targets)} local and "
-            f"{len(workshop_targets)} Steam Workshop mod(s)."
+            f"Pre-launch update check: {len(local_targets)} enabled SteamCMD mod(s). "
+            "Steam manages subscribed Workshop mods."
         )
         unavailable_ids: set[str] = set()
         remote_times = fetch_remote_update_times(
-            all_targets,
+            local_targets,
             self.progress,
             progress_count=self.update_busy_check_progress,
             unavailable_out=unavailable_ids,
         )
-        resolved_steamcmd = find_or_install_steamcmd(self.progress) if local_targets else find_steamcmd()
-        if resolved_steamcmd:
-            self.after(0, lambda: self.steamcmd_path.set(str(resolved_steamcmd)))
-            self.after(0, self.save_configured_paths)
+        resolved_steamcmd = find_or_install_steamcmd(self.progress)
+        self.after(0, lambda: self.steamcmd_path.set(str(resolved_steamcmd)))
+        self.after(0, self.save_configured_paths)
 
-        if local_targets and resolved_steamcmd:
-            local_outdated, local_unknown = workshop_outdated_ids(
-                local_targets,
-                steamcmd_acf_path(resolved_steamcmd.parent),
-                remote_times,
-                refresh_untracked=True,
-            )
-        else:
-            local_outdated, local_unknown = [], []
+        local_outdated, local_unknown = workshop_outdated_ids(
+            local_targets,
+            steamcmd_acf_path(resolved_steamcmd.parent),
+            remote_times,
+            refresh_untracked=True,
+        )
         reused = reuse_current_workshop_copies(result, local_outdated, remote_times, self.progress)
         if reused:
             result = self.scan_paths_with_required(required_snapshot, self.progress)
-            local_targets = steamcmd_update_target_ids(result)
-            workshop_targets = steam_workshop_update_target_ids(result)
             local_outdated = [item_id for item_id in local_outdated if item_id not in reused]
-        workshop_outdated, workshop_unknown = workshop_outdated_ids(
-            workshop_targets,
-            steam_client_acf_path(result.workshop_path),
-            remote_times,
-        )
 
         if local_outdated:
             recorded_local_times = parse_steamcmd_update_times(resolved_steamcmd.parent)
             unverified = sum(item_id not in recorded_local_times for item_id in local_outdated)
             self.progress(f"SteamCMD refresh: {len(local_outdated) - unverified} known updates and {unverified} existing local mod(s) without a download record. These are not new pack additions.")
-            run_steamcmd_downloads(
-                result,
-                self.progress,
-                targets=local_outdated,
-                progress_count=self.update_busy_download_progress,
-            )
+            self.after(0, self.show_activity)
+            pending_downloads = download_target_ids(result)
+            unchecked = [item_id for item_id in pending_downloads if item_id not in remote_times and item_id not in unavailable_ids]
+            if unchecked:
+                remote_times.update(fetch_remote_update_times(unchecked, self.progress, unavailable_out=unavailable_ids))
+            targets = local_outdated
+            if pending_downloads and all(item_id in remote_times for item_id in pending_downloads):
+                targets = list(dict.fromkeys([*local_outdated, *pending_downloads]))
+                self.progress(f"Downloading {len(local_outdated)} updates and {len(pending_downloads)} pending mods together.")
+            try:
+                run_steamcmd_downloads(
+                    result,
+                    self.progress,
+                    targets=targets,
+                    progress_count=self.update_busy_download_progress,
+                    checked_update_times=remote_times,
+                )
+            except UnavailableWorkshopItems as exc:
+                if set(exc.item_ids) & set(local_outdated):
+                    raise
+                if not self.review_unavailable_items(result, exc.item_ids):
+                    raise SetupCancelled("Setup cancelled before changing the game configuration or launching.")
             result = self.scan_paths_with_required(required_snapshot, self.progress)
-        if workshop_outdated:
-            self.progress(
-                f"{len(workshop_outdated)} subscribed Workshop mod(s) need updates; "
-                "Steam will apply them as RimWorld launches."
-            )
-        unknown_count = len(set(local_unknown) | set(workshop_unknown))
-        if unknown_count:
-            self.progress(f"{unknown_count} installed mod(s) could not be version-compared.")
-        if not local_outdated and not workshop_outdated and not unknown_count:
+        if local_unknown:
+            self.progress(f"{len(local_unknown)} installed SteamCMD mod(s) could not be version-compared.")
+        if not local_outdated and not local_unknown:
             self.progress("Pre-launch update check found no updates.")
         return result
 
@@ -4937,6 +5112,7 @@ class ProgressorApp(tk.Tk):
         return decision["accepted"]
 
     def download_with_unavailable_review(self, result: ScanResult, required_snapshot) -> ScanResult:
+        self.after(0, self.show_activity)
         while True:
             try:
                 run_steamcmd_downloads(result, self.progress, progress_count=self.update_busy_download_progress)
@@ -4975,7 +5151,7 @@ class ProgressorApp(tk.Tk):
                     os.environ["STEAMCMD"] = steamcmd
 
                 self.progress("Play Now started.")
-                required_snapshot = fetch_required_items(self.progress)
+                required_snapshot = fetch_required_items(self.progress, refresh_titles=False)
                 result = self.scan_paths_with_required(required_snapshot, self.progress)
                 if auto_update:
                     result = self.apply_updates_before_launch(result, required_snapshot)
@@ -5048,8 +5224,9 @@ class ProgressorApp(tk.Tk):
         def worker() -> None:
             try:
                 result = self.scan_paths(self.progress)
+                sort_result = get_or_build_sort_result(result, self.progress)
                 self.current_result = result
-                self.after(0, lambda: self.render_result(result))
+                self.after(0, lambda: self.render_result(result, sort_result))
             except (RuntimeError, urllib.error.URLError, OSError) as exc:
                 self.progress(f"Scan failed: {exc}")
                 error = str(exc)
@@ -5071,8 +5248,9 @@ class ProgressorApp(tk.Tk):
         def worker() -> None:
             try:
                 result = scan_with_required(required, workshop, local_mods, config, self.progress, exclude_cosmetics=exclude_cosmetics, excluded_dlcs=excluded_dlcs)
+                sort_result = get_or_build_sort_result(result, self.progress)
                 self.current_result = result
-                self.after(0, lambda: self.render_result(result))
+                self.after(0, lambda: self.render_result(result, sort_result))
                 self.progress("Installed mods loaded using the saved pack list. Refresh pack updates the online list.")
             except (RuntimeError, OSError) as exc:
                 self.progress(f"Could not load installed mods: {exc}")
@@ -5117,13 +5295,11 @@ class ProgressorApp(tk.Tk):
             item_id = package_to_item.get(package_id)
             if item_id:
                 item = result.required.get(item_id)
-                metadata = cached_mod_metadata(result.item_paths[item_id], item_id)
                 if item and item.title:
                     title = item.title
-                elif metadata:
-                    title = metadata.name
                 else:
-                    title = package_id
+                    metadata = cached_mod_metadata(result.item_paths[item_id], item_id)
+                    title = metadata.name if metadata else package_id
                 if item_id in result.local_steamcmd_ids or not item_id.isdigit():
                     source = "Local"
                 elif item:
@@ -5787,11 +5963,13 @@ class ProgressorApp(tk.Tk):
                         reused = reuse_current_workshop_copies(result, local_outdated, remote_times, self.progress)
                         remaining = [item_id for item_id in local_outdated if item_id not in reused]
                         if remaining:
+                            self.after(0, self.show_activity)
                             run_steamcmd_downloads(
                                 result,
                                 self.progress,
                                 targets=remaining,
                                 progress_count=self.update_busy_download_progress,
+                                checked_update_times=remote_times,
                             )
                         updated_local = True
                     else:
