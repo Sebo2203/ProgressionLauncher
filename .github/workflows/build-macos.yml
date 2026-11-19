@@ -1,4 +1,4 @@
-name: Build macOS
+name: Build Apple Silicon release fallback
 
 on:
   workflow_dispatch:
@@ -23,10 +23,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15
+          - os: macos-26
             arch: arm64
-          - os: macos-15-intel
-            arch: x86_64
     runs-on: ${{ matrix.os }}
     env:
       MAC_ZIP: ProgressionLauncher-macOS-v0.4.8-${{ matrix.arch }}-test.zip
