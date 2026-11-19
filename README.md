@@ -86,7 +86,7 @@ Known and previously read DLC requirements are skipped before downloading. A mod
 
 The mod library shows the next launch's active load order beside inactive and missing mods. Select a mod to inspect its status, package ID, requirements, and folder. Use `Enable / pin`, `Disable`, or `Use pack default` to manage your overrides, then `Apply & sort` to save without launching. The active list stays in dependency order; click an inactive-list heading to sort by name, status, or pack.
 
-The curved-arrow button beside `Use pack default` undoes your last manual pin, disable or reset action (`Ctrl+Z`, or `Ã¢Å’ËœZ` on Mac). A multi-mod change is undone together. Undo history survives restarts and preserves unrelated choices. It restores your saved overrides; `Apply & sort` writes the resulting load order. DLC and Cosmetics filters still apply.
+The curved-arrow button beside `Use pack default` undoes your last manual pin, disable or reset action (`Ctrl+Z`, or `Command+Z` on Mac). A multi-mod change is undone together. Undo history survives restarts and preserves unrelated choices. It restores your saved overrides; `Apply & sort` writes the resulting load order. DLC and Cosmetics filters still apply.
 
 `Show activity` records each changed mod's name, ID and previous/new state, plus settings changes and operations such as scans, downloads and launches. Recent activity is restored when the launcher reopens. Logs and the last 500 manual mod actions are saved locally under the launcher's data folder in `activity/`; routine search and selection changes are omitted. Undo does not reverse downloads, game launches, profile deletion or applied game configuration.
 
