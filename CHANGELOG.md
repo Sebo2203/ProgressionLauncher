@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.9
+
+- Show a banner when a newer launcher build is available.
+- Update and restart from the banner on Windows. Mac and Linux get a download link.
+
 ## 0.4.8
 
 - Open Activity automatically for downloads and show the current mod, completed count, and updates during long waits.

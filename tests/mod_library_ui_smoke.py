@@ -161,6 +161,20 @@ with tempfile.TemporaryDirectory() as temp:
         assert ui.log_visible and ui.log_frame.winfo_manager() == "grid"
         ui.toggle_activity()
         assert not ui.log_visible
+        update = app.LauncherUpdate("99.0.0", "v99.0.0", "ProgressionLauncher-v99.0.0.exe", True)
+        ui.show_launcher_update(update)
+        assert ui.update_banner.winfo_manager() == "grid"
+        assert ui.update_button.cget("text") == "Download update"
+        with patch.object(app.webbrowser, "open") as open_download:
+            ui.choose_launcher_update()
+            open_download.assert_called_once_with(update.download_url)
+            ui.set_busy("Test download")
+            ui.choose_launcher_update()
+            assert open_download.call_count == 1
+            assert ui.update_button.instate(["disabled"])
+            ui.clear_busy()
+            assert ui.update_button.instate(["!disabled"])
+        ui.update_banner.grid_remove()
         ui.geometry('1280x680')
         ui.deiconify()
         ui.update()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import datetime as _dt
 import concurrent.futures
 import difflib
@@ -7,6 +8,7 @@ import hashlib
 import heapq
 import json
 import os
+import platform
 import plistlib
 import queue
 import re
@@ -32,7 +34,7 @@ import tkinter as tk
 
 APP_ID = "294100"
 APP_NAME = "Progression Launcher"
-APP_VERSION = "0.4.8"
+APP_VERSION = "0.4.9"
 COLLECTIONS = {
     "Core": "3521297585",
     "Content": "3521319712",
@@ -107,6 +109,182 @@ def app_data_dir() -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
 
+
+UPDATE_REPO = "Sebo2203/ProgressionLauncher"
+RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases"
+UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases?per_page=50"
+MAX_LAUNCHER_UPDATE_BYTES = 150 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class LauncherUpdate:
+    version: str
+    tag: str
+    asset: str
+    checksum_available: bool
+
+    @property
+    def release_url(self) -> str:
+        return f"{RELEASES_URL}/tag/{self.tag}"
+
+    @property
+    def download_url(self) -> str:
+        return f"{RELEASES_URL}/download/{self.tag}/{self.asset}"
+
+
+def select_update(releases, current_version: str, system: str, machine: str) -> LauncherUpdate | None:
+    machine = machine.lower()
+    if system == "win32" and machine in {"amd64", "x86_64"}:
+        suffix, asset_pattern = "", "ProgressionLauncher-v{}.exe"
+    elif system == "darwin" and machine in {"arm64", "x86_64"}:
+        suffix, asset_pattern = "-macos-test", "ProgressionLauncher-macOS-v{}-" + machine + "-test.zip"
+    elif system == "linux" and machine in {"amd64", "x86_64"}:
+        suffix, asset_pattern = "-linux-test", "ProgressionLauncher-Linux-v{}-x86_64-test.tar.gz"
+    else:
+        return None
+
+    current, separator, _ = current_version.partition("-")
+    current_key = tuple(map(int, current.split("."))), not separator
+    newest = current_key
+    update = None
+    for release in releases:
+        tag = release.get("tag_name", "")
+        match = re.fullmatch(r"v(\d+\.\d+\.\d+)" + re.escape(suffix), tag)
+        if not match or release.get("draft") or bool(release.get("prerelease")) != bool(suffix):
+            continue
+        version = match[1]
+        key = tuple(map(int, version.split("."))), True
+        if key <= newest:
+            continue
+        assets = {asset["name"] for asset in release.get("assets", []) if asset.get("state") == "uploaded"}
+        asset = asset_pattern.format(version)
+        if asset in assets:
+            newest = key
+            update = LauncherUpdate(version, tag, asset, asset + ".sha256" in assets)
+    return update
+
+
+def check_for_update(current_version: str, system: str, machine: str) -> LauncherUpdate | None:
+    request = urllib.request.Request(UPDATE_API_URL, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"ProgressionLauncher/{current_version}",
+    })
+    with urllib.request.urlopen(request, timeout=8) as response:
+        releases = json.loads(response.read(2 * 1024 * 1024 + 1))
+    return select_update(releases, current_version, system, machine)
+
+
+def open_release_asset(url: str):
+    response = urllib.request.urlopen(url, timeout=20)
+    destination = urllib.parse.urlsplit(response.geturl())
+    if destination.scheme != "https" or destination.hostname not in {
+        "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com",
+    }:
+        response.close()
+        raise RuntimeError("GitHub redirected the update to an unexpected download host.")
+    return response
+
+
+def stage_windows_update(update: LauncherUpdate, executable: Path, progress) -> tuple[Path, str]:
+    if not update.checksum_available:
+        raise RuntimeError("This release has no published checksum.")
+    with open_release_asset(update.download_url + ".sha256") as response:
+        checksum = response.read(1025).decode("ascii").strip()
+    match = re.fullmatch(r"([0-9a-fA-F]{64})\s+\*?" + re.escape(update.asset), checksum)
+    if not match:
+        raise RuntimeError("The published checksum does not match the update filename.")
+    expected = match[1].lower()
+    stage = Path(tempfile.mkdtemp(prefix=".progression-update-", dir=executable.parent))
+    target = stage / "verified-update.exe"
+    try:
+        digest = hashlib.sha256()
+        downloaded = 0
+        progress(f"Downloading Progression Launcher v{update.version}…")
+        with open_release_asset(update.download_url) as response, target.open("xb") as stream:
+            while chunk := response.read(256 * 1024):
+                downloaded += len(chunk)
+                if downloaded > MAX_LAUNCHER_UPDATE_BYTES:
+                    raise RuntimeError("The launcher update is larger than expected.")
+                digest.update(chunk)
+                stream.write(chunk)
+        if digest.hexdigest() != expected:
+            raise RuntimeError("The launcher update failed checksum verification.")
+        with target.open("rb") as stream:
+            if stream.read(2) != b"MZ":
+                raise RuntimeError("The update is not a Windows executable.")
+        return target, expected
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+# File.Replace makes the old executable the backup in the same operation.
+# Retry sharing violations while the PyInstaller parent releases the old exe.
+WINDOWS_HANDOFF = r"""
+$ErrorActionPreference = 'Stop'
+$target = $env:PROGRESSION_UPDATE_TARGET
+$staged = $env:PROGRESSION_UPDATE_STAGED
+$stage = [IO.Path]::GetDirectoryName($staged)
+$parent = [IO.Path]::GetDirectoryName($target)
+$backupDir = Join-Path $parent '.progression-launcher-backups'
+$backup = Join-Path $backupDir ('ProgressionLauncher-' + [Guid]::NewGuid().ToString('N') + '.exe')
+$oldExited = $false
+$replaced = $false
+try {
+    $old = Get-Process -Id ([int]$env:PROGRESSION_UPDATE_PID) -ErrorAction SilentlyContinue
+    if ($old -and -not $old.WaitForExit(30000)) { throw 'The previous launcher is still running.' }
+    $oldExited = $true
+    $hash = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($staged)
+    try { $actual = [BitConverter]::ToString($hash.ComputeHash($stream)).Replace('-', '') }
+    finally { $stream.Dispose(); $hash.Dispose() }
+    if ($actual -ne $env:PROGRESSION_UPDATE_HASH) {
+        throw 'The staged launcher failed checksum verification.'
+    }
+    [IO.Directory]::CreateDirectory($backupDir) | Out-Null
+    for ($attempt = 0; ; $attempt++) {
+        try {
+            [IO.File]::Replace($staged, $target, $backup)
+            $replaced = $true
+            break
+        } catch [IO.IOException] {
+            if ($attempt -ge 39) { throw }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    $env:PYINSTALLER_RESET_ENVIRONMENT = '1'
+    Start-Process -FilePath $target -WorkingDirectory $parent
+} catch {
+    $reason = $_.Exception.Message
+    try {
+        if ($replaced) { [IO.File]::Replace($backup, $target, $staged) }
+        if ($oldExited) {
+            $env:PYINSTALLER_RESET_ENVIRONMENT = '1'
+            Start-Process -FilePath $target -WorkingDirectory $parent
+        }
+    } catch {
+        $reason += [Environment]::NewLine + $_.Exception.Message
+    }
+    Add-Type -AssemblyName System.Windows.Forms
+    [Windows.Forms.MessageBox]::Show($reason, 'Progression Launcher update failed') | Out-Null
+} finally {
+    if ([IO.File]::Exists($staged)) { [IO.File]::Delete($staged) }
+    if ([IO.Directory]::Exists($stage)) { [IO.Directory]::Delete($stage) }
+}
+"""
+
+
+def start_windows_handoff(executable: Path, staged: Path, checksum: str) -> subprocess.Popen:
+    powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    encoded = base64.b64encode(WINDOWS_HANDOFF.encode("utf-16-le")).decode("ascii")
+    env = dict(os.environ, PROGRESSION_UPDATE_TARGET=str(executable),
+               PROGRESSION_UPDATE_STAGED=str(staged), PROGRESSION_UPDATE_HASH=checksum,
+               PROGRESSION_UPDATE_PID=str(os.getpid()))
+    return subprocess.Popen(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
+        cwd=str(executable.parent), env=env, creationflags=subprocess.CREATE_NO_WINDOW,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
 
 def asset_path(name: str) -> Path:
     bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -3989,6 +4167,9 @@ class ProgressorApp(tk.Tk):
         self.dlc_checkbuttons = []
         self.current_result: ScanResult | None = None
         self._busy = False
+        self.launcher_update: LauncherUpdate | None = None
+        self.update_in_progress = False
+        self.update_label = tk.StringVar(value="")
         self.current_sort_result: SortResult | None = None
         self.current_rows: list[tuple[str, str, str, str | None, QuarantinedMod | None]] = []
         self.load_order_rows: list[tuple[str, str, str, str | None, QuarantinedMod | None]] = []
@@ -4038,6 +4219,8 @@ class ProgressorApp(tk.Tk):
         self.update_quick_frozen_button()
         self.protocol("WM_DELETE_WINDOW", self.close_app)
         self.after(150, self.load_installed_on_startup)
+        if getattr(sys, "frozen", False):
+            self.after(600, self.start_update_check)
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self)
@@ -4052,6 +4235,12 @@ class ProgressorApp(tk.Tk):
         style.configure("TLabelframe.Label", background="#101418", foreground="#f2b35d")
         style.configure("TButton", background="#1b252b", foreground="#e9efec", bordercolor="#33414c", lightcolor="#1b252b", darkcolor="#1b252b", focusthickness=0, padding=(10, 6))
         style.map("TButton", background=[("active", "#26343d")], foreground=[("active", "#ffffff")])
+        style.configure("LauncherUpdate.TButton", font=("Segoe UI", 11, "bold"),
+                        background="#2365dc", foreground="#ffffff", bordercolor="#8bb7ff",
+                        lightcolor="#2365dc", darkcolor="#2365dc", focusthickness=2, padding=(14, 8))
+        style.map("LauncherUpdate.TButton",
+                  background=[("disabled", "#294b78"), ("pressed", "#2052ad"), ("active", "#2870f3")],
+                  foreground=[("disabled", "#d4e1f4"), ("!disabled", "#ffffff")])
         style.configure("TCheckbutton", background="#101418", foreground="#d7dedb")
         style.configure("TCombobox", fieldbackground="#161d22", background="#202b34", foreground="#eef3ef", arrowcolor="#9fb1bd", bordercolor="#33414c", lightcolor="#202b34", darkcolor="#202b34", padding=5)
         style.map(
@@ -4097,6 +4286,17 @@ class ProgressorApp(tk.Tk):
             font=("Segoe UI", 11, "bold"),
             foreground="#9fb1ad",
         ).grid(row=0, column=1, sticky="ne", padx=(14, 0), pady=(4, 0))
+
+        self.update_banner = tk.Frame(header, bg="#17345c", highlightthickness=1,
+                                      highlightbackground="#5997ef", highlightcolor="#5997ef")
+        self.update_banner.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 3))
+        self.update_banner.columnconfigure(0, weight=1)
+        tk.Label(self.update_banner, textvariable=self.update_label, bg="#17345c", fg="#f0f6ff",
+                 font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w", padx=14, pady=8)
+        self.update_button = ttk.Button(self.update_banner, command=self.choose_launcher_update,
+                                        style="LauncherUpdate.TButton")
+        self.update_button.grid(row=0, column=1, sticky="e", padx=(8, 10), pady=6)
+        self.update_banner.grid_remove()
 
         quick = ttk.Frame(self, padding=(18, 4, 18, 12))
         quick.grid(row=1, column=0, sticky="ew")
@@ -4854,7 +5054,83 @@ class ProgressorApp(tk.Tk):
         except OSError as exc:
             self.progress(f"Could not save paths: {exc}")
 
+    def start_update_check(self) -> None:
+        def worker() -> None:
+            try:
+                update = check_for_update(APP_VERSION, sys.platform, platform.machine())
+            except (OSError, ValueError, TypeError, AttributeError, KeyError):
+                return  # An offline launcher remains usable.
+            if update:
+                try:
+                    self.after(0, self.show_launcher_update, update)
+                except (RuntimeError, tk.TclError):
+                    pass  # The launcher closed while GitHub was responding.
+
+        self.run_worker(worker)
+
+    def can_install_launcher_update(self) -> bool:
+        return bool(self.launcher_update and self.launcher_update.checksum_available
+                    and sys.platform == "win32" and getattr(sys, "frozen", False)
+                    and Path(sys.executable).suffix.lower() == ".exe")
+
+    def show_launcher_update(self, update: LauncherUpdate) -> None:
+        self.launcher_update = update
+        self.update_label.set(f"Update available · v{update.version}")
+        self.update_button.configure(
+            text="Update & restart" if self.can_install_launcher_update() else "Download update",
+            state="disabled" if self._busy else "normal",
+        )
+        self.update_banner.grid()
+
+    def choose_launcher_update(self) -> None:
+        update = self.launcher_update
+        if not update or self._busy:
+            return
+        if not self.can_install_launcher_update():
+            webbrowser.open(update.download_url)
+            return
+
+        executable = Path(sys.executable)
+        self.update_in_progress = True
+        self.set_busy("Downloading launcher update…")
+        self.update_label.set(f"Downloading launcher v{update.version}…")
+
+        def worker() -> None:
+            try:
+                staged, checksum = stage_windows_update(update, executable, self.progress)
+            except (OSError, ValueError, RuntimeError) as exc:
+                self.after(0, self.launcher_update_failed, str(exc))
+            else:
+                self.after(0, self.finish_launcher_update, executable, staged, checksum)
+
+        self.run_worker(worker)
+
+    def launcher_update_failed(self, reason: str) -> None:
+        self.update_in_progress = False
+        self.clear_busy()
+        update = self.launcher_update
+        if update:
+            self.show_launcher_update(update)
+            if messagebox.askyesno(
+                "Launcher update failed",
+                f"{reason}\n\nOpen the release page to download the update manually?",
+                parent=self,
+            ):
+                webbrowser.open(update.release_url)
+
+    def finish_launcher_update(self, executable: Path, staged: Path, checksum: str) -> None:
+        try:
+            self.save_configured_paths()
+            start_windows_handoff(executable, staged, checksum)
+        except (OSError, ValueError, KeyError) as exc:
+            shutil.rmtree(staged.parent, ignore_errors=True)
+            self.launcher_update_failed(str(exc))
+            return
+        self.destroy()
+
     def close_app(self) -> None:
+        if self.update_in_progress:
+            return
         self.save_configured_paths()
         self.destroy()
 
@@ -4931,6 +5207,7 @@ class ProgressorApp(tk.Tk):
 
     def set_busy(self, message: str) -> None:
         self._busy = True
+        self.update_button.configure(state="disabled")
         self.update_undo_button()
         for button in self.selection_buttons:
             button.configure(state="disabled")
@@ -4961,6 +5238,8 @@ class ProgressorApp(tk.Tk):
 
     def clear_busy(self) -> None:
         self._busy = False
+        if self.launcher_update:
+            self.update_button.configure(state="normal")
         self.update_undo_button()
         self.optimize_button.configure(state="normal")
         for checkbox in self.dlc_checkbuttons:

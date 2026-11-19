@@ -23,13 +23,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15
+          - os: macos-26
             arch: arm64
           - os: macos-15-intel
             arch: x86_64
     runs-on: ${{ matrix.os }}
     env:
-      MAC_ZIP: ProgressionLauncher-macOS-v0.4.8-${{ matrix.arch }}-test.zip
+      MAC_ZIP: ProgressionLauncher-macOS-v0.4.9-${{ matrix.arch }}-test.zip
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -49,6 +49,7 @@ jobs:
           python tests/replacement_recovery_smoke.py
           python tests/load_last_smoke.py
           python tests/download_progress_smoke.py
+          python tests/launcher_update_smoke.py
       - name: Build native app and encoder
         run: bash build_macos.sh
       - name: Check native texture conversion
