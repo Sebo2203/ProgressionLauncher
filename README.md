@@ -2,11 +2,11 @@
 
 Windows, macOS and Linux helper for launching Ferny's Progression RimWorld modpack.
 
-[**Download Progression Launcher v0.4.9 for Windows**](https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.4.9/ProgressionLauncher-v0.4.9.exe)
+[**Download Progression Launcher v0.5.0 for Windows**](https://github.com/Sebo2203/ProgressionLauncher/releases/download/v0.5.0/ProgressionLauncher-v0.5.0.exe)
 
-[**Download for macOS (Apple Silicon or Intel, test builds)**](https://github.com/Sebo2203/ProgressionLauncher/releases/tag/v0.4.9-macos-test)
+[**Download for macOS (Apple Silicon or Intel, test builds)**](https://github.com/Sebo2203/ProgressionLauncher/releases/tag/v0.5.0-macos-test)
 
-[**Download for Linux x86_64 (experimental)**](https://github.com/Sebo2203/ProgressionLauncher/releases/tag/v0.4.9-linux-test)
+[**Download for Linux x86_64 (experimental)**](https://github.com/Sebo2203/ProgressionLauncher/releases/tag/v0.5.0-linux-test)
 
 The [download page](https://sebo2203.github.io/ProgressionLauncher/) lists all three platforms. Mac and Linux packages are built and checked on native GitHub runners before publication. See [MAC_TESTER.md](MAC_TESTER.md) and [LINUX_TESTER.md](LINUX_TESTER.md) for tester instructions.
 
@@ -94,11 +94,10 @@ Search both lists by name, Workshop ID, or package ID (`Ctrl+F`; `Escape` clears
 
 When frozen profiles exist, the selected profile is also available directly beneath `PLAY NOW`. The launcher remembers that selection between restarts. Hover over the adjacent `?` for a summary of the difference between live and frozen play.
 
-## What is new in v0.4.9
+## What is new in v0.5.0
 
-- A blue banner appears when a newer launcher build is available.
-- On Windows, **Update & restart** verifies the download, backs up the old executable, and opens the new version.
-- On Mac and Linux, **Download update** opens the build for your platform.
+- The update banner shows how much of the launcher update has downloaded.
+- On Windows, the updater restores the previous build if the new version exits before its main window opens.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history. Existing frozen profiles are unchanged.
 
@@ -217,7 +216,7 @@ build_exe.bat
 The built app appears at:
 
 ```text
-dist\ProgressionLauncher-v0.4.9.exe
+dist\ProgressionLauncher-v0.5.0.exe
 ```
 
 To build a macOS app bundle on a Mac:
