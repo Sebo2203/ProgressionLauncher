@@ -27,7 +27,7 @@ chmod +x todds/todds
   --distpath dist --workpath "$BUILD_ROOT/work" --specpath "$BUILD_ROOT" \
   "$(pwd)/progressor.py"
 
-VERSION=$("$VENV/bin/python" -c 'import progressor; print(progressor.APP_VERSION)')
+VERSION=$("$VENV/bin/python" -c 'import progressor; base, sep, suffix = progressor.APP_VERSION.partition("-"); print(base + ".0" * (2 - base.count(".")) + sep + suffix)')
 ARCHIVE="ProgressionLauncher-Linux-v${VERSION}-x86_64-test.tar.gz"
 tar -czf "dist/$ARCHIVE" -C dist ProgressionLauncher
 (cd dist && sha256sum "$ARCHIVE" > "$ARCHIVE.sha256")

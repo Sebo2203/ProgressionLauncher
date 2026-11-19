@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.0
+
+- Show launcher update download progress in the banner.
+- Restore the previous Windows launcher if an update exits before opening its main window.
+
 ## 0.4.9
 
 - Show a banner when a newer launcher build is available.

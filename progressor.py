@@ -34,7 +34,7 @@ import tkinter as tk
 
 APP_ID = "294100"
 APP_NAME = "Progression Launcher"
-APP_VERSION = "0.4.9"
+APP_VERSION = "0.5.0"
 COLLECTIONS = {
     "Core": "3521297585",
     "Content": "3521319712",
@@ -114,6 +114,7 @@ UPDATE_REPO = "Sebo2203/ProgressionLauncher"
 RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases?per_page=50"
 MAX_LAUNCHER_UPDATE_BYTES = 150 * 1024 * 1024
+UPDATE_READY_ENV = "PROGRESSION_UPDATE_READY"
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,12 @@ class LauncherUpdate:
         return f"{RELEASES_URL}/download/{self.tag}/{self.asset}"
 
 
+def launcher_version_key(version: str) -> tuple[tuple[int, ...], bool]:
+    base, separator, _ = version.partition("-")
+    parts = tuple(map(int, base.split(".")))
+    return parts + (0,) * (3 - len(parts)), not separator
+
+
 def select_update(releases, current_version: str, system: str, machine: str) -> LauncherUpdate | None:
     machine = machine.lower()
     if system == "win32" and machine in {"amd64", "x86_64"}:
@@ -143,17 +150,15 @@ def select_update(releases, current_version: str, system: str, machine: str) -> 
     else:
         return None
 
-    current, separator, _ = current_version.partition("-")
-    current_key = tuple(map(int, current.split("."))), not separator
-    newest = current_key
+    newest = launcher_version_key(current_version)
     update = None
     for release in releases:
         tag = release.get("tag_name", "")
-        match = re.fullmatch(r"v(\d+\.\d+\.\d+)" + re.escape(suffix), tag)
+        match = re.fullmatch(r"v(\d+\.\d+(?:\.\d+)?)" + re.escape(suffix), tag)
         if not match or release.get("draft") or bool(release.get("prerelease")) != bool(suffix):
             continue
         version = match[1]
-        key = tuple(map(int, version.split("."))), True
+        key = launcher_version_key(version)
         if key <= newest:
             continue
         assets = {asset["name"] for asset in release.get("assets", []) if asset.get("state") == "uploaded"}
@@ -185,7 +190,7 @@ def open_release_asset(url: str):
     return response
 
 
-def stage_windows_update(update: LauncherUpdate, executable: Path, progress) -> tuple[Path, str]:
+def stage_windows_update(update: LauncherUpdate, executable: Path, progress, download_progress=None) -> tuple[Path, str]:
     if not update.checksum_available:
         raise RuntimeError("This release has no published checksum.")
     with open_release_asset(update.download_url + ".sha256") as response:
@@ -201,12 +206,22 @@ def stage_windows_update(update: LauncherUpdate, executable: Path, progress) -> 
         downloaded = 0
         progress(f"Downloading Progression Launcher v{update.version}…")
         with open_release_asset(update.download_url) as response, target.open("xb") as stream:
+            size = getattr(response, "headers", {}).get("Content-Length", "")
+            total = int(size) if size and size.isdecimal() else None
+            if total is not None and total > MAX_LAUNCHER_UPDATE_BYTES:
+                raise RuntimeError("The launcher update is larger than expected.")
+            next_report = 0.0
             while chunk := response.read(256 * 1024):
                 downloaded += len(chunk)
                 if downloaded > MAX_LAUNCHER_UPDATE_BYTES:
                     raise RuntimeError("The launcher update is larger than expected.")
                 digest.update(chunk)
                 stream.write(chunk)
+                if download_progress and time.monotonic() >= next_report:
+                    download_progress(downloaded, total)
+                    next_report = time.monotonic() + 0.2
+        if download_progress:
+            download_progress(downloaded, total)
         if digest.hexdigest() != expected:
             raise RuntimeError("The launcher update failed checksum verification.")
         with target.open("rb") as stream:
@@ -226,10 +241,12 @@ $target = $env:PROGRESSION_UPDATE_TARGET
 $staged = $env:PROGRESSION_UPDATE_STAGED
 $stage = [IO.Path]::GetDirectoryName($staged)
 $parent = [IO.Path]::GetDirectoryName($target)
+$ready = Join-Path $stage 'launcher-ready'
 $backupDir = Join-Path $parent '.progression-launcher-backups'
 $backup = Join-Path $backupDir ('ProgressionLauncher-' + [Guid]::NewGuid().ToString('N') + '.exe')
 $oldExited = $false
 $replaced = $false
+$newLauncher = $null
 try {
     $old = Get-Process -Id ([int]$env:PROGRESSION_UPDATE_PID) -ErrorAction SilentlyContinue
     if ($old -and -not $old.WaitForExit(30000)) { throw 'The previous launcher is still running.' }
@@ -253,12 +270,32 @@ try {
         }
     }
     $env:PYINSTALLER_RESET_ENVIRONMENT = '1'
-    Start-Process -FilePath $target -WorkingDirectory $parent
+    $env:PROGRESSION_UPDATE_READY = $ready
+    try {
+        $newLauncher = Start-Process -FilePath $target -WorkingDirectory $parent -PassThru
+    } finally {
+        Remove-Item Env:PROGRESSION_UPDATE_READY -ErrorAction SilentlyContinue
+    }
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while (-not [IO.File]::Exists($ready)) {
+        if ($newLauncher.WaitForExit(250)) {
+            if ([IO.File]::Exists($ready)) { break }
+            throw 'The updated launcher closed before its main window opened.'
+        }
+        if ($timer.Elapsed.TotalSeconds -ge 60) {
+            throw "The updated launcher is still running, but startup was not confirmed. Previous version: $backup"
+        }
+    }
 } catch {
     $reason = $_.Exception.Message
     try {
-        if ($replaced) { [IO.File]::Replace($backup, $target, $staged) }
-        if ($oldExited) {
+        if (-not $newLauncher -or $newLauncher.HasExited) {
+            if ($replaced) {
+                [IO.File]::Replace($backup, $target, $staged)
+                $reason += [Environment]::NewLine + 'The previous version was restored.'
+            }
+        }
+        if ($oldExited -and (-not $newLauncher -or $newLauncher.HasExited)) {
             $env:PYINSTALLER_RESET_ENVIRONMENT = '1'
             Start-Process -FilePath $target -WorkingDirectory $parent
         }
@@ -269,6 +306,7 @@ try {
     [Windows.Forms.MessageBox]::Show($reason, 'Progression Launcher update failed') | Out-Null
 } finally {
     if ([IO.File]::Exists($staged)) { [IO.File]::Delete($staged) }
+    if ([IO.File]::Exists($ready)) { [IO.File]::Delete($ready) }
     if ([IO.Directory]::Exists($stage)) { [IO.Directory]::Delete($stage) }
 }
 """
@@ -285,6 +323,14 @@ def start_windows_handoff(executable: Path, staged: Path, checksum: str) -> subp
         cwd=str(executable.parent), env=env, creationflags=subprocess.CREATE_NO_WINDOW,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+
+
+def confirm_launcher_startup(marker: Path) -> None:
+    try:
+        with marker.open("x", encoding="ascii") as stream:
+            stream.write("ready\n")
+    except OSError:
+        pass  # The helper may have already stopped waiting.
 
 def asset_path(name: str) -> Path:
     bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -5095,9 +5141,17 @@ class ProgressorApp(tk.Tk):
         self.set_busy("Downloading launcher update…")
         self.update_label.set(f"Downloading launcher v{update.version}…")
 
+        def report_download(received: int, total: int | None) -> None:
+            mib = 1024 ** 2
+            if total:
+                detail = f"{min(100, received * 100 // total)}% · {received / mib:.1f} / {total / mib:.1f} MiB"
+            else:
+                detail = f"{received / mib:.1f} MiB received"
+            self.after(0, self.update_label.set, f"Downloading launcher v{update.version} · {detail}")
+
         def worker() -> None:
             try:
-                staged, checksum = stage_windows_update(update, executable, self.progress)
+                staged, checksum = stage_windows_update(update, executable, self.progress, report_download)
             except (OSError, ValueError, RuntimeError) as exc:
                 self.after(0, self.launcher_update_failed, str(exc))
             else:
@@ -6414,6 +6468,7 @@ class ProgressorApp(tk.Tk):
 
 
 def main() -> int:
+    update_marker = os.environ.pop(UPDATE_READY_ENV, "")
     if sys.platform not in {"win32", "darwin", "linux"}:
         print("Progression Launcher supports Windows, macOS and Linux. Other OSes may need manual setup.")
     acquired, existing_processes = acquire_single_instance()
@@ -6422,6 +6477,12 @@ def main() -> int:
         return 1
     try:
         app = ProgressorApp()
+        if update_marker:
+            def confirm_window(event) -> None:
+                if event.widget is app:
+                    app.after_idle(confirm_launcher_startup, Path(update_marker))
+
+            app.bind("<Map>", confirm_window, add="+")
         app.mainloop()
         return 0
     finally:
